@@ -1,4 +1,4 @@
-﻿"""
+"""
 risk_engine.py - Progressive Risk Scoring & Behaviour Classification (DEV 1)
 =============================================================================
 Smart India Hackathon 2026 | Problem: SIH26187
@@ -116,6 +116,9 @@ ZONE_MULTIPLIER: Dict[str, float] = {
 
 # Loiter bonus: extra risk per second of continuous loitering (on top of base)
 LOITER_BONUS_PER_SEC: float = 2.5
+
+# Grace period: zone-exit frames allowed before dwell counter resets
+DWELL_RESET_GRACE: int = 20
 
 # Night mode multiplier (applied to final risk score when --night flag is set)
 NIGHT_MULTIPLIER: float = 1.30
@@ -488,6 +491,7 @@ class RiskEngine:
                 "risk"        : 0.0,
                 "track_age"   : 0,
                 "dwell_frames": 0,
+                "out_frames"  : 0,
                 "behavior"    : "none",
                 "last_zone_id": None,
             })
@@ -534,10 +538,17 @@ class RiskEngine:
             state["last_zone_id"] = zone_id
 
             # ---- 3. Dwell time tracking ----
-            if in_restricted:
+            in_zone = in_restricted or (alert_type_be == "presence")
+            if in_zone:
                 state["dwell_frames"] += 1
+                state["out_frames"]    = 0   # back inside — reset grace counter
             else:
-                state["dwell_frames"] = 0
+                # Grace period: only reset dwell after DWELL_RESET_GRACE
+                # consecutive out-of-zone frames. Prevents loiter counter
+                # resetting because of a single noisy / boundary-edge frame.
+                state["out_frames"] = state.get("out_frames", 0) + 1
+                if state["out_frames"] >= DWELL_RESET_GRACE:
+                    state["dwell_frames"] = 0
 
             dwell_sec = state["dwell_frames"] / safe_fps
 

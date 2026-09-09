@@ -1,4 +1,4 @@
-﻿from ultralytics import YOLO
+from ultralytics import YOLO
 
 # Use the standard YOLO11 Small model ('yolo11s.pt') for better accuracy on household items.
 # (If it's not downloaded yet, ultralytics will auto-download it).

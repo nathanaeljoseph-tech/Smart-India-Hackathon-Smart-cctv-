@@ -1,4 +1,4 @@
-﻿"""
+"""
 detector.py - YOLO11 Multi-Class Object Detection Module (DEV 1)
 ================================================================
 Smart India Hackathon 2026 | Problem: SIH26187
@@ -176,6 +176,9 @@ class YOLODetector:
                 self.device = "cpu"
         else:
             self.device = device
+        self._tracker_type = "bytetrack.yaml"  # set via set_tracker_type()
+        self._ema_centroids = {}
+        self._track_ages = {}  # {track_id: (cx, cy)} for ByteTrack EMA
 
         gpu_info = ""
         if self.device != "cpu" and torch is not None and torch.cuda.is_available():
@@ -230,6 +233,139 @@ class YOLODetector:
         blank = np.zeros((self.input_size, self.input_size, 3), dtype=np.uint8)
         self.model(blank, verbose=False, device=self.device)
         self.logger.debug("Warm-up done.")
+
+    def set_tracker_type(self, tracker_type: str) -> None:
+        """Set the Ultralytics tracker config to use (bytetrack or botsort)."""
+        mapping = {
+            "bytetrack": "bytetrack.yaml",
+            "botsort"  : "botsort.yaml",
+        }
+        self._tracker_type = mapping.get(tracker_type, "bytetrack.yaml")
+        self.logger.info(f"ByteTrack tracker set to: {self._tracker_type}")
+
+
+    def reset_tracker(self) -> None:
+        """Reset the internal ByteTrack tracker, EMA centroids, and track ages."""
+        self._ema_centroids.clear()
+        self._track_ages.clear()
+        try:
+            if hasattr(self.model, "predictor") and self.model.predictor is not None:
+                if hasattr(self.model.predictor, "trackers"):
+                    for t in self.model.predictor.trackers:
+                        if hasattr(t, "reset"):
+                            t.reset()
+        except Exception as e:
+            self.logger.warning(f"Tracker reset warning: {e}")
+
+    def track(self, frame: np.ndarray):
+        """
+        Run YOLO + ByteTrack in a single model.track() call.
+
+        Returns (detections, tracks) where:
+          - detections : same format as detect() ? all classes, full HUD info
+          - tracks     : person-only list with stable ByteTrack IDs + EMA centroids
+        """
+        if self.model is None:
+            self.logger.error("track() called before load_model()!")
+            return [], []
+        if frame is None or frame.size == 0:
+            return [], []
+
+        EMA_ALPHA = 0.35  # smoother than FallbackIOUTracker for ByteTrack
+
+        try:
+            results = self.model.track(
+                frame,
+                imgsz   = self.input_size,
+                conf    = self.conf_threshold,
+                iou     = 0.5,
+                persist = True,               # keeps Kalman state across frames
+                tracker = self._tracker_type,
+                device  = self.device,
+                verbose = False,
+            )
+
+            # All-class detections for HUD (reuse existing parse + close-range logic)
+            detections = self._parse_results(results, frame.shape)
+            h, w = frame.shape[:2]
+            people_found = any(d.get("is_person") for d in detections)
+            for d in detections:
+                if not d.get("is_person"):
+                    x1, y1, x2, y2 = d["bbox"]
+                    bh = (y2 - y1) / max(1, h)
+                    ar = d.get("bbox_area_ratio", 0.0)
+                    if (bh >= 0.40 or ar >= 0.15) and d.get("class") in (
+                            "tie", "backpack", "suitcase", "umbrella"):
+                        d["is_person"] = True; d["class"] = "person"
+                        d["class_id"] = 0; people_found = True
+
+            # Person tracks with ByteTrack IDs
+            tracks = self._parse_tracks(results, frame.shape)
+
+            # Update EMA centroids per track
+            new_ema = {}
+            for t in tracks:
+                tid = t["track_id"]
+                cx, cy = t["_raw_cx"], t["_raw_cy"]
+                if tid in self._ema_centroids:
+                    ex, ey = self._ema_centroids[tid]
+                    ex = EMA_ALPHA * cx + (1 - EMA_ALPHA) * ex
+                    ey = EMA_ALPHA * cy + (1 - EMA_ALPHA) * ey
+                else:
+                    ex, ey = float(cx), float(cy)
+                new_ema[tid] = (ex, ey)
+                t["ema_centroid"] = [int(ex), int(ey)]
+                self._track_ages[tid] = self._track_ages.get(tid, 0) + 1
+                t["track_age"] = self._track_ages[tid]
+            self._ema_centroids = new_ema
+
+            # Remove helper keys
+            for t in tracks:
+                t.pop("_raw_cx", None); t.pop("_raw_cy", None)
+
+            return detections, tracks
+
+        except Exception as e:
+            self.logger.error(f"track() error: {e}. Falling back to detect().")
+            return self.detect(frame), []
+
+    def _parse_tracks(self, results, shape) -> list:
+        """Extract ByteTrack person tracks from model.track() results."""
+        tracks = []
+        result = results[0]
+        if result.boxes is None or len(result.boxes) == 0:
+            return []
+        if result.boxes.id is None:
+            return []   # no tracks assigned yet (first 1-2 frames)
+
+        h, w = shape[:2]
+        for box in result.boxes:
+            if int(box.cls[0]) != 0:   # person only
+                continue
+            if box.id is None:
+                continue
+            track_id = int(box.id[0])
+            conf     = float(box.conf[0])
+            x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+            x1 = max(0, min(x1, w - 1)); y1 = max(0, min(y1, h - 1))
+            x2 = max(0, min(x2, w - 1)); y2 = max(0, min(y2, h - 1))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
+            tracks.append({
+                "track_id"    : track_id,
+                "bbox"        : [x1, y1, x2, y2],
+                "confidence"  : conf,
+                "class"       : "person",
+                "class_id"    : 0,
+                "is_person"   : True,
+                "track_age"   : 1,
+                "ema_centroid": [cx, cy],   # updated after EMA calc
+                "_raw_cx"     : cx,
+                "_raw_cy"     : cy,
+            })
+        return tracks
 
     def detect(self, frame: np.ndarray) -> List[Dict[str, Any]]:
         """

@@ -1,4 +1,4 @@
-﻿<<<<<<< HEAD
+<<<<<<< HEAD
 # AMST Border-Net | DEV 1 Module
 
 > **Smart India Hackathon 2026**  

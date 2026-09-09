@@ -1,4 +1,4 @@
-﻿"""
+"""
 scripts/train_ucf_fence_mini.py
 ================================
 AMST Border-Net | SIH 2026 | DEV 1

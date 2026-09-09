@@ -1,4 +1,4 @@
-﻿"""
+"""
 utils.py - Utility Module for AMST Border-Net (DEV 1)
 ======================================================
 Smart India Hackathon 2026 | Problem: SIH26187

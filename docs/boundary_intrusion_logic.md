@@ -1,4 +1,4 @@
-﻿# Boundary Intrusion Logic ΓÇö AMST Border-Net
+# Boundary Intrusion Logic ΓÇö AMST Border-Net
 ## SIH26187 | DEV 1 | 2026-09-08
 
 ---

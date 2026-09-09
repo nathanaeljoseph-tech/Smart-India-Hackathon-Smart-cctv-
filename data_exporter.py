@@ -1,4 +1,4 @@
-﻿"""
+"""
 data_exporter.py - Detection & Tracking Data Export Module (DEV 1)
 ===================================================================
 Smart India Hackathon 2026 | Problem: SIH26187

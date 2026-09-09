@@ -1,5 +1,36 @@
-﻿output/
-__pycache__/
+﻿# ============================================================
+# .gitignore — AMST Border-Net | SIH26187
+# ============================================================
+
+# --- Large local-only data (never push to GitHub) ---
+output/
+data/
+datasets/
 archive.zip
 Resources.zip
-data/
+
+# --- Trained model weights (large binary files) ---
+*.pt
+*.onnx
+*.engine
+
+# --- Python cache ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- Logs ---
+*.log
+
+# --- Training run artifacts ---
+runs/
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+
+# --- IDE/editor files ---
+.vscode/
+.idea/
+*.swp

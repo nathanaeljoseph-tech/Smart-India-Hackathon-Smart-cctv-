@@ -1,4 +1,4 @@
-﻿"""Inspect the Resources.zip archive (it uses deflate64, so try 7z/tar)."""
+"""Inspect the Resources.zip archive (it uses deflate64, so try 7z/tar)."""
 import subprocess
 import collections
 

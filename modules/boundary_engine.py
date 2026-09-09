@@ -1,4 +1,4 @@
-﻿"""
+"""
 boundary_engine.py - Restricted Zone Intrusion & Loitering Detection
 =====================================================================
 Smart India Hackathon 2026 | Problem: SIH26187
@@ -164,14 +164,19 @@ def check_loitering(
 
     min_frames = max(1, int(min_duration_sec * fps))
 
-    # Walk backwards from the newest entry, counting consecutive inside frames.
+    # Walk backwards from newest entry, counting inside frames with grace period for edge jitter.
     consecutive = 0
+    outside_grace = 0
+    MAX_OUTSIDE_GRACE = 8  # Allow up to ~0.5s of transient border jitter without reset
     for entry in reversed(track_history):
         cx, cy = entry["xy"]
         if point_in_polygon(cx, cy, region_polygon):
             consecutive += 1
+            outside_grace = 0
         else:
-            break   # Chain broken ΓÇö not continuously inside zone
+            outside_grace += 1
+            if outside_grace > MAX_OUTSIDE_GRACE:
+                break
 
     return consecutive >= min_frames
 

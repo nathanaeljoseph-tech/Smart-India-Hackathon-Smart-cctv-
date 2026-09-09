@@ -1,4 +1,4 @@
-﻿"""
+"""
 train_custom.py - Auto Download + Train YOLOv11n for Border Surveillance
 =========================================================================
 Smart India Hackathon 2026 | Problem: SIH26187

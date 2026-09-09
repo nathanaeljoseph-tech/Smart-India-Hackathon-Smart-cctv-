@@ -1,4 +1,4 @@
-﻿"""
+"""
 pick_zone_points.py ΓÇö Interactive Zone Coordinate Picker
 =========================================================
 SIH26187 | AMST Border-Net

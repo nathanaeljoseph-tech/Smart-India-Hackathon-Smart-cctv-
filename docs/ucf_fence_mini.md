@@ -1,4 +1,4 @@
-﻿# UCF Fence Mini-Dataset
+# UCF Fence Mini-Dataset
 
 ## Overview
 

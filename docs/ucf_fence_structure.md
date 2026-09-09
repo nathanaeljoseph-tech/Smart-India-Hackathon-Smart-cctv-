@@ -1,4 +1,4 @@
-﻿# UCF-Crime with Fence Climbing Dataset Structure
+# UCF-Crime with Fence Climbing Dataset Structure
 
 ## Overview
 - **Source Archive**: `C:\Users\Lenovo\SIH\archive.zip` (4.10 GB)

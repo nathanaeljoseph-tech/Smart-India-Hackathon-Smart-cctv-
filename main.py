@@ -1,4 +1,4 @@
-﻿"""
+"""
 main.py - Primary Entry Point for AMST Border-Net (DEV 1)
 ==========================================================
 Smart India Hackathon 2026 | Problem: SIH26187
@@ -12,7 +12,7 @@ This is the main script that ties everything together:
   2. Open video source (webcam / file / RTSP)
   3. Load YOLO11n model (CPU only)
   4. Initialize ByteTrack tracker
-  5. Main loop: read ΓåÆ detect ΓåÆ track ΓåÆ draw ΓåÆ display ΓåÆ export
+  5. Main loop: read ?????? detect ?????? track ?????? draw ?????? display ?????? export
   6. Graceful shutdown on 'q' or Ctrl+C
 
 --- HOW TO RUN ---
@@ -77,7 +77,15 @@ try:
 except ImportError:
     _RISK_ENGINE_AVAILABLE = False
     logger_pre = logging.getLogger("amst_border_net")
-    logger_pre.warning("modules/risk_engine.py not found ΓÇö Tier-1 risk scoring disabled.")
+    logger_pre.warning("modules/risk_engine.py not found ?????? Tier-1 risk scoring disabled.")
+
+# --- Camera Tamper / Visibility Monitor ---
+try:
+    from modules.tamper_detector import CameraTamperDetector, draw_tamper_overlay
+    _TAMPER_DETECTOR_AVAILABLE = True
+except ImportError:
+    _TAMPER_DETECTOR_AVAILABLE = False
+
 
 
 # ===========================================================================
@@ -248,7 +256,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help=(
-            "Enable night-time mode. Applies a risk multiplier (├ù1.30 by default) "
+            "Enable night-time mode. Applies a risk multiplier (?????1.30 by default) "
             "to all risk scores, raising alert levels faster in low-visibility conditions."
         )
     )
@@ -265,8 +273,8 @@ def main():
     Main entry point. Orchestrates the entire detection + tracking pipeline.
 
     Flow:
-        parse args ΓåÆ setup logging ΓåÆ open video ΓåÆ load model ΓåÆ init tracker
-        ΓåÆ init exporter ΓåÆ main loop ΓåÆ shutdown
+        parse args ?????? setup logging ?????? open video ?????? load model ?????? init tracker
+        ?????? init exporter ?????? main loop ?????? shutdown
     """
 
     # --- Step 1: Parse arguments ---
@@ -283,7 +291,7 @@ def main():
 
     # --- Boundary Engine (Hook 1: load config) ---
     # Gracefully skip if config file is missing, yaml is not installed, or
-    # the boundary engine module is unavailable ΓÇö no errors, no alerts.
+    # the boundary engine module is unavailable ?????? no errors, no alerts.
     boundary_zones: List[Dict] = []
     _ref_res   = None
     _risk_cfg  : Dict = {}   # Full config dict forwarded to RiskEngine
@@ -297,21 +305,21 @@ def main():
             _risk_cfg = _cfg   # Pass the full config to RiskEngine
             _raw_zones = _cfg.get("zones", []) or []
             for _z in _raw_zones:
-                # Convert polygon lists ΓåÆ tuples for geometry functions
+                # Convert polygon lists ?????? tuples for geometry functions
                 _z["polygon"] = [tuple(p) for p in _z.get("polygon", [])]
             boundary_zones = [z for z in _raw_zones if len(z.get("polygon", [])) >= 3]
             if boundary_zones:
                 logger.info(f"Boundary Engine: {len(boundary_zones)} zone(s) loaded from {_BOUNDARY_CFG}")
             else:
-                logger.info("Boundary Engine: config found but no valid zones ΓÇö running without alerts.")
+                logger.info("Boundary Engine: config found but no valid zones ?????? running without alerts.")
         except FileNotFoundError:
-            logger.info("Boundary Engine: config/boundary_config.yaml not found ΓÇö running without zones.")
+            logger.info("Boundary Engine: config/boundary_config.yaml not found ?????? running without zones.")
         except Exception as _be_err:
-            logger.warning(f"Boundary Engine: config load failed ({_be_err}) ΓÇö running without zones.")
+            logger.warning(f"Boundary Engine: config load failed ({_be_err}) ?????? running without zones.")
     elif not _BOUNDARY_ENGINE_AVAILABLE:
-        logger.info("Boundary Engine: modules/boundary_engine.py not found ΓÇö skipping.")
+        logger.info("Boundary Engine: modules/boundary_engine.py not found ?????? skipping.")
     else:
-        logger.info("Boundary Engine: PyYAML not installed (pip install pyyaml) ΓÇö skipping.")
+        logger.info("Boundary Engine: PyYAML not installed (pip install pyyaml) ?????? skipping.")
 
     # --- Step 3: Open video source ---
     cap = open_video_source(args.source, logger)
@@ -356,18 +364,27 @@ def main():
     #   model.track(tracker="bytetrack") requires a bytetrack.yaml config file
     #   to be present in the Ultralytics package. If it's missing or the version
     #   doesn't match, model.track() silently falls back to detecting ALL 80 COCO
-    #   classes ΓÇö ignoring our classes=[0] filter. This caused pens, cups, and
+    #   classes ?????? ignoring our classes=[0] filter. This caused pens, cups, and
     #   other objects to be detected and labeled on screen.
     #
     # WHY model.predict() + FallbackIOUTracker?
     #   model.predict(classes=[0]) is GUARANTEED to only detect people.
     #   It never silently changes behavior. FallbackIOUTracker then assigns
     #   consistent IDs across frames. This combination is 100% reliable.
-    tracker = FallbackIOUTracker(
-        iou_threshold   = 0.25,   # Lower threshold for large, close-range boxes
-        max_lost_frames = 25,     # Keep IDs alive longer during brief occlusion
-    )
-    logger.info("Tracker: FallbackIOUTracker (predict+track pipeline ΓÇö people only).")
+    use_bytetrack = (args.tracker in ("bytetrack", "botsort"))
+    if use_bytetrack:
+        detector.set_tracker_type(args.tracker)
+        tracker = FallbackIOUTracker(
+            iou_threshold   = 0.25,
+            max_lost_frames = 25,
+        )
+        logger.info(f"Tracker: {args.tracker.upper()} via model.track() (Kalman + ByteTrack pipeline active).")
+    else:
+        tracker = FallbackIOUTracker(
+            iou_threshold   = 0.25,
+            max_lost_frames = 25,
+        )
+        logger.info("Tracker: FallbackIOUTracker (pure Python IOU tracker).")
 
     # --- Step 5b: Initialize Risk Engine ---
     risk_engine: Optional[Any] = None
@@ -378,7 +395,7 @@ def main():
             f"approach_ratio={_risk_cfg.get('approach_band_ratio', 0.20)}"
         )
     else:
-        logger.info("Risk Engine: unavailable ΓÇö running without Tier-1 risk scoring.")
+        logger.info("Risk Engine: unavailable ?????? running without Tier-1 risk scoring.")
 
     # --- Step 6: Initialize Data Exporter ---
     exporter = DataExporter(
@@ -426,7 +443,12 @@ def main():
     _too_close_conf  = float(_risk_cfg.get("too_close_conf_threshold", 0.60))
 
     if args.night:
-        logger.info("Night mode ACTIVE ΓÇö risk multiplier applied to all scores.")
+        logger.info("Night mode ACTIVE ?????? risk multiplier applied to all scores.")
+
+    # --- Camera Tamper / Visibility Monitor ---
+    tamper_detector = CameraTamperDetector() if _TAMPER_DETECTOR_AVAILABLE else None
+    if tamper_detector:
+        logger.info("CameraTamperDetector active.")
 
     logger.info("Main loop starting. Press 'q' to quit, 'p' to pause.")
     logger.info("-" * 60)
@@ -457,6 +479,12 @@ def main():
                 )
                 # For webcam: try to reconnect briefly before giving up
                 if isinstance(args.source, str) and args.source.isdigit():
+                    if tamper_detector is not None:
+                        import numpy as _np
+                        _blk = _np.zeros((frame_height, frame_width, 3), dtype="uint8")
+                        draw_tamper_overlay(_blk, tamper_detector.check_feed_lost(), frame_id)
+                        cv2.imshow(window_name, _blk)
+                        cv2.waitKey(1)
                     logger.info("Waiting 1 second then retrying...")
                     time.sleep(1)
                     continue
@@ -465,6 +493,18 @@ def main():
                     break
 
             frame_id += 1
+
+            # --- Camera Tamper / Visibility Check ---
+            if tamper_detector is not None:
+                _ts = tamper_detector.check(frame)
+                if _ts.is_fault:
+                    draw_tamper_overlay(frame, _ts, frame_id)
+                    cv2.imshow(window_name, frame)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord("q") or key == 27:
+                        logger.info("Quit requested during tamper alert.")
+                        break
+                    continue
 
             # --- FPS tick (count every read frame for true FPS) ---
             fps_counter.tick()
@@ -480,39 +520,40 @@ def main():
                 proc_id += 1
 
                 # ---------------------------------------------------------------
-                # STEP A: DETECT ΓÇö run YOLO on ALL 80 COCO classes
+                                # STEP A & C: DETECT & TRACK (ByteTrack or Fallback)
                 # ---------------------------------------------------------------
-                # detector.detect() uses classes=None ΓåÆ detects everything.
-                # It returns a rich dict for each object with:
-                #   class, class_id, bbox, confidence, is_person, color
-                # This gives us correct labels for every object in the scene.
-                dets = detector.detect(frame)
+                if use_bytetrack:
+                    dets, tracks = detector.track(frame)
+                    people_raw  = [d for d in dets if d.get("is_person")]
+                    other_dets  = [d for d in dets if not d.get("is_person")]
 
-                # ---------------------------------------------------------------
-                # STEP B: SPLIT ΓÇö people vs. other objects
-                # Also apply too-close filtering before passing to tracker.
-                # ---------------------------------------------------------------
-                people_raw  = [d for d in dets if d["is_person"]]
-                other_dets  = [d for d in dets if not d["is_person"]]
-
-                # Too-close filtering:
-                #   normal_dets  ΓåÆ safe to track (bbox height < threshold)
-                #   very_close_dets ΓåÆ HUD-only (bbox almost fills frame height)
-                if _RISK_ENGINE_AVAILABLE and frame_height > 0:
-                    people_dets, very_close_dets = filter_too_close(
-                        people_raw,
-                        frame_h      = frame_height,
-                        height_ratio = _too_close_ratio,
-                        conf_threshold = _too_close_conf,
-                    )
+                    if _RISK_ENGINE_AVAILABLE and frame_height > 0:
+                        people_dets, very_close_dets = filter_too_close(
+                            people_raw,
+                            frame_h        = frame_height,
+                            height_ratio   = _too_close_ratio,
+                            conf_threshold = _too_close_conf,
+                        )
+                    else:
+                        people_dets     = people_raw
+                        very_close_dets = []
                 else:
-                    people_dets     = people_raw
-                    very_close_dets = []
+                    dets = detector.detect(frame)
+                    people_raw  = [d for d in dets if d.get("is_person")]
+                    other_dets  = [d for d in dets if not d.get("is_person")]
 
-                # ---------------------------------------------------------------
-                # STEP C: TRACK ΓÇö assign persistent IDs to normal-range people
-                # ---------------------------------------------------------------
-                tracks = tracker.update(people_dets)
+                    if _RISK_ENGINE_AVAILABLE and frame_height > 0:
+                        people_dets, very_close_dets = filter_too_close(
+                            people_raw,
+                            frame_h        = frame_height,
+                            height_ratio   = _too_close_ratio,
+                            conf_threshold = _too_close_conf,
+                        )
+                    else:
+                        people_dets     = people_raw
+                        very_close_dets = []
+
+                    tracks = tracker.update(people_dets)
 
                 last_tracks          = tracks
                 last_dets            = dets
@@ -715,7 +756,7 @@ def main():
                 cv2.putText(frame, banner_text, (bx, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
 
             # ---------------------------------------------------------------
-            # ALERT CARD PANELS (Tier-1) ΓÇö right side of frame
+            # ALERT CARD PANELS (Tier-1) ?????? right side of frame
             # ---------------------------------------------------------------
             # Draw a compact alert card for each non-NORMAL track.
             # Each card shows: ID | BEHAVIOR | ALERT_LEVEL | risk bar | reasoning
@@ -769,7 +810,7 @@ def main():
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
 
                     # Reasoning (truncated)
-                    reason_short = reason[:36] + "ΓÇª" if len(reason) > 36 else reason
+                    reason_short = reason[:36] + "??????" if len(reason) > 36 else reason
                     cv2.putText(frame, reason_short, (_panel_x + 4, cy1 + 49),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 180, 180), 1, cv2.LINE_AA)
 
@@ -866,6 +907,8 @@ def main():
 
             elif key == ord('r'):               # Reset tracker
                 tracker.reset()
+                if use_bytetrack and hasattr(detector, 'reset_tracker'):
+                    detector.reset_tracker()
                 if risk_engine is not None:
                     risk_engine.reset()
                 track_histories.clear()

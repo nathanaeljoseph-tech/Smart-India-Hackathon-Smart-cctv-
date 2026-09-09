@@ -1,4 +1,4 @@
-﻿virat_root: "data/virat"
+virat_root: "data/virat"
 train_videos: "data/virat/videos/*.mp4"
 val_videos: "data/virat/videos/*.mp4"
 classes: ["person", "car", "truck", "bus", "motorcycle", "gun", "weapon"]

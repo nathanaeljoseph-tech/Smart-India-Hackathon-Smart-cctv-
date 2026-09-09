@@ -1,4 +1,4 @@
-﻿import zipfile
+import zipfile
 import collections
 
 z = zipfile.ZipFile('archive.zip')
