@@ -1,0 +1,62 @@
+﻿# ============================================================
+# requirements.txt - AMST Border-Net (DEV 1)
+# Smart India Hackathon 2026 | SIH26187
+# ============================================================
+# 
+# INSTALLATION INSTRUCTIONS:
+#   pip install -r requirements.txt
+#
+# All packages below are CPU-compatible. No CUDA required.
+# Tested on: Python 3.10, Windows 11, Intel i5-13420H
+#
+# ============================================================
+
+# --- Core Computer Vision ---
+# OpenCV: Reading video, drawing, displaying frames
+opencv-python>=4.8.0
+
+# --- YOLO11 Detection & Built-in Tracking ---
+# Ultralytics provides YOLO11 + ByteTrack + BotSORT out of the box
+# This is the most important package - installs YOLO, PyTorch, etc.
+ultralytics>=8.3.0
+
+# --- Numerical Computing ---
+# NumPy: Array operations, IoU matrix computation
+numpy>=1.24.0
+
+# --- Data Handling ---
+# These are standard library modules (no install needed):
+#   json     - JSON export
+#   logging  - Debug/info logging
+#   argparse - CLI argument parsing
+#   datetime - Timestamps
+#   os       - File/directory operations
+#   time     - FPS measurement
+#   sys      - System exit handling
+#   collections - deque for FPS rolling average
+
+# --- Optional: CPU Acceleration ---
+# Uncomment if you want to try OpenVINO acceleration on Intel CPU/iGPU
+# Note: May require additional setup on Windows
+# openvino>=2024.0.0
+
+# --- Optional: ONNX Runtime (alternative CPU acceleration) ---
+# Ultralytics can export to ONNX for faster CPU inference
+# onnxruntime>=1.17.0
+
+# ============================================================
+# NOTES FOR DEV 1:
+#
+# 1. PyTorch (torch) is installed AUTOMATICALLY as a dependency
+#    of ultralytics. You do NOT need to install it separately.
+#    It will install the CPU-only version on a machine with no NVIDIA GPU.
+#
+# 2. On first run, yolo11n.pt (~6MB) is auto-downloaded from GitHub.
+#    Make sure you have internet access for the first run.
+#
+# 3. If pip install is slow, try:
+#    pip install -r requirements.txt --index-url https://pypi.org/simple/
+#
+# 4. If you get a torch CUDA warning, ignore it.
+#    The code explicitly uses device="cpu" everywhere.
+# ============================================================

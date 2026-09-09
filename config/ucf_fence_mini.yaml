@@ -1,0 +1,56 @@
+﻿# UCF Fence Mini-Dataset Configuration
+# AMST Border-Net | SIH 2026
+# Generated: 2026-09-07
+
+dataset_root: "C:\\Users\\Lenovo\\SIH\\data\\ucf_fence_mini"
+
+classes:
+  - name: "fence_climbing"
+    clips:
+      - "Fence_Climbing_1"
+      - "Fence_Climbing_3"
+      - "Suspicious4"
+
+  - name: "fighting"
+    clips:
+      - "Fighting041"
+      - "Fighting004"
+      - "Fighting008"
+
+  - name: "stealing"
+    clips:
+      - "Stealing025"
+      - "Stealing077"
+      - "Stealing086"
+
+  - name: "robbery"
+    clips:
+      - "Robbery014"
+      - "Robbery026"
+
+  - name: "shooting"
+    clips:
+      - "Shooting032"
+      - "Shooting006"
+
+detection:
+  model: "yolo11n.pt"
+  conf_threshold: 0.35
+  classes: ["person", "car", "truck", "bus", "motorcycle"]
+  # COCO class IDs for the above: 0=person, 2=car, 7=truck, 5=bus, 3=motorcycle
+  class_ids: [0, 2, 3, 5, 7]
+  image_size: 512
+  # device: auto-detected at runtime (cuda if available, else cpu)
+
+tracking:
+  tracker_type: "bytetrack"
+  iou_threshold: 0.5
+  max_age: 30
+  min_hits: 3
+
+output:
+  root: "output/ucf_fence_mini"
+  summary_json: "output/ucf_fence_mini/summary.json"
+  videos_dir: "output/ucf_fence_mini/videos"
+  # fps used when writing annotated output video
+  output_fps: 15

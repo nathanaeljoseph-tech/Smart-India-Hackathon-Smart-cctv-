@@ -1,0 +1,103 @@
+﻿# AMST Border-Net | boundary_config.yaml
+# =========================================
+# 3-Tier Spatial Model (top ΓåÆ bottom):
+#
+#   ΓöîΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÉ  ΓöÇΓöÇΓöÇ y = 0
+#   Γöé                                    Γöé
+#   Γöé         PERIMETER ZONE             Γöé  y = 0 to y = 576  (top 80%)
+#   Γöé       (type: restricted)           Γöé  ΓåÆ immediate intrusion alert
+#   Γöé                                    Γöé
+#   Γö£ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöñ  ΓöÇΓöÇΓöÇ y = 576  (80% of 720)
+#   Γöé         APPROACH BAND              Γöé  y = 576 to y = 720  (bottom 20%)
+#   Γöé          (type: monitor)           Γöé  ΓåÆ approach behaviour detected
+#   ΓööΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÿ  ΓöÇΓöÇΓöÇ y = 720
+#
+# Scale factor: scale_zones_to_frame() in main.py auto-scales these
+# pixel coordinates to match whatever camera resolution is in use.
+
+reference_resolution:
+  - 1280
+  - 720
+
+# ---------------------------------------------------------------------------
+# Behaviour / Risk Engine constants
+# All values here are read by RiskEngine.__init__() and override the
+# module-level defaults in modules/risk_engine.py
+# ---------------------------------------------------------------------------
+
+# Bottom fraction of frame height treated as the "approach band"
+# 0.20 = bottom 20 % of the frame.  Tune this if your camera angle changes.
+approach_band_ratio: 0.20
+
+# Track must be this many frames old before behaviour is assigned.
+# Prevents jitter on brand-new detections.
+min_track_len_for_behavior: 12
+
+# Continuous dwell time inside the perimeter zone to trigger a loiter alert.
+min_loiter_seconds: 8
+
+# ---------------------------------------------------------------------------
+# Too-close filtering
+# ---------------------------------------------------------------------------
+# If a person's bounding-box height exceeds this fraction of the frame height
+# they are considered "very close to the camera" (< ~2 ft away / 15-30 cm).
+# Such detections are excluded from distance tracking and trigger a CRITICAL PROXIMITY BREACH alert.
+too_close_height_ratio: 0.70
+
+# Minimum confidence required to accept a very-close detection.
+# Lowered to 0.35 to ensure macro close-ups and camera obstructions are not missed.
+too_close_conf_threshold: 0.35
+
+# Proximity threat settings
+proximity_threat_enabled: true
+proximity_risk_score: 98.0
+
+# ---------------------------------------------------------------------------
+# Risk engine parameters
+# ---------------------------------------------------------------------------
+risk:
+  # Base risk contribution for each behaviour type (0ΓÇô100 scale)
+  base_approach: 20    # Person in approach band moving toward camera
+  base_access:   40    # Person confirmed inside restricted zone
+  base_loiter:   55    # Person loitering in restricted zone
+
+  # Additional risk per second of continuous loitering (stacks on base_loiter)
+  loiter_bonus_per_sec: 2.5
+
+  # Risk decay: points shed per SECOND when behaviour returns to "none"
+  # Higher = faster decay; lower = risk lingers longer after person retreats
+  decay_rate: 8.0
+
+  # Hysteresis: maximum risk DROP per frame (prevents flickering)
+  hysteresis_band: 5.0
+
+  # Night-time multiplier applied to the final risk score when --night is set
+  night_multiplier: 1.30
+
+# ---------------------------------------------------------------------------
+# Zone definitions
+# ---------------------------------------------------------------------------
+zones:
+  # ΓöÇΓöÇ Zone 1: Main restricted perimeter (top 80 % of frame) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+  # Any person entering this zone triggers an immediate intrusion alert.
+  - id: perimeter
+    type: restricted
+    polygon:
+      - [0,    0]
+      - [1280, 0]
+      - [1280, 576]   # 576 = 720 * 0.80
+      - [0,    576]
+    min_loiter_seconds: 8
+
+  # ΓöÇΓöÇ Zone 2: Approach band (bottom 20 % of frame) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+  # Monitored but not restricted ΓÇö presence alone does not trigger an alert.
+  # The risk engine uses this band to detect "approaching" behaviour.
+  # min_loiter_seconds is set very high so loitering never fires here.
+  - id: approach_band
+    type: monitor
+    polygon:
+      - [0,    576]   # top of approach band
+      - [1280, 576]
+      - [1280, 720]
+      - [0,    720]
+    min_loiter_seconds: 9999
