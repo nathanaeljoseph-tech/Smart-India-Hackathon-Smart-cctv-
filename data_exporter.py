@@ -172,7 +172,10 @@ class DataExporter:
                     "confidence"  : t.get("confidence", 0.0),
                     "class"       : t.get("class", "person"),
                     "track_age"   : t.get("track_age",  0),
-                    "is_too_close": t.get("is_too_close", False),
+                    # --- Tier-2 fields ---
+                    "is_animal"         : card.get("is_animal", t.get("is_animal", False)),
+                    "is_abandoned"      : card.get("is_abandoned", False),
+                    "context_violation" : card.get("context_violation", False),
                     # --- Boundary Engine fields ---
                     "alert_type"  : card.get("alert_type",  t.get("alert_type",  "none")),
                     "severity"    : card.get("severity",    t.get("severity",    "none")),
@@ -181,10 +184,39 @@ class DataExporter:
                     "behavior"    : card.get("behavior",    "none"),
                     "risk_score"  : card.get("risk_score",  0.0),
                     "alert_level" : card.get("alert_level", "NORMAL"),
-                    "reasoning"   : card.get("reasoning",  "Monitoring ΓÇö no immediate threat"),
+                    "reasoning"   : card.get("reasoning",  "Monitoring — no immediate threat"),
                     "dwell_sec"   : card.get("dwell_sec",   0.0),
                 }
                 formatted_detections.append(record)
+
+            # Include any virtual/special alert cards (e.g. ABANDONED-*, PROX-*)
+            track_id_set = {t["track_id"] for t in tracks}
+            for cid, card in cards.items():
+                if cid not in track_id_set:
+                    cb = card.get("bbox", [0, 0, 0, 0])
+                    cc = card.get("centroid", [(cb[0]+cb[2])//2, (cb[1]+cb[3])//2])
+                    record = {
+                        "track_id"          : card.get("track_id", cid),
+                        "bbox"              : cb,
+                        "centroid"          : cc,
+                        "ema_centroid"      : card.get("ema_centroid", cc),
+                        "confidence"        : card.get("confidence", 0.9),
+                        "class"             : card.get("class", "object"),
+                        "track_age"         : card.get("track_age", 0),
+                        "is_too_close"      : card.get("is_too_close", False),
+                        "is_animal"         : card.get("is_animal", False),
+                        "is_abandoned"      : card.get("is_abandoned", False),
+                        "context_violation" : card.get("context_violation", False),
+                        "alert_type"        : card.get("alert_type", "none"),
+                        "severity"          : card.get("severity", "none"),
+                        "zone_id"           : card.get("zone_id", None),
+                        "behavior"          : card.get("behavior", "none"),
+                        "risk_score"        : card.get("risk_score", 0.0),
+                        "alert_level"       : card.get("alert_level", "NORMAL"),
+                        "reasoning"         : card.get("reasoning", ""),
+                        "dwell_sec"         : card.get("dwell_sec", 0.0),
+                    }
+                    formatted_detections.append(record)
 
         else:
             # FALLBACK: No tracking data, just use raw detections

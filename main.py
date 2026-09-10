@@ -86,6 +86,26 @@ try:
 except ImportError:
     _TAMPER_DETECTOR_AVAILABLE = False
 
+# --- Tier-2 Modules: Illumination & Abandoned Objects ---
+try:
+    from modules.illumination import IlluminationManager, get_illumination_state
+    _ILLUMINATION_AVAILABLE = True
+except ImportError:
+    _ILLUMINATION_AVAILABLE = False
+
+try:
+    from modules.abandoned_engine import AbandonedObjectEngine, _bbox_iou
+    _ABANDONED_ENGINE_AVAILABLE = True
+except ImportError:
+    _ABANDONED_ENGINE_AVAILABLE = False
+    def _bbox_iou(b1, b2): return 0.0
+
+try:
+    from modules.zone_context import ZoneContextMemory
+    _ZONE_CONTEXT_AVAILABLE = True
+except ImportError:
+    _ZONE_CONTEXT_AVAILABLE = False
+
 
 
 # ===========================================================================
@@ -147,12 +167,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--conf-threshold",
         type=float,
-        default=0.45,
+        default=0.35,
         help=(
             "Minimum confidence score (0.0-1.0) to accept a detection. "
             "Lower = more detections but more false positives. "
             "Higher = fewer detections but more accurate. "
-            "Default: 0.45  (raised from 0.35 to reduce false positives on objects)"
+            "Default: 0.35 (optimized for animals, screens, and border monitoring)"
         )
     )
 
@@ -256,9 +276,89 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help=(
-            "Enable night-time mode. Applies a risk multiplier (?????1.30 by default) "
-            "to all risk scores, raising alert levels faster in low-visibility conditions."
+            "Enable manual night-time mode. Forces night risk multiplier and CLAHE."
         )
+    )
+
+    # --- Tier-2: Animal Suppression ---
+    parser.add_argument(
+        "--enable-animal-suppression",
+        dest="enable_animal_suppression",
+        action="store_true",
+        default=True,
+        help="Enable suppression of false alarms from animals (default: True)."
+    )
+    parser.add_argument(
+        "--no-animal-suppression",
+        dest="enable_animal_suppression",
+        action="store_false",
+        help="Disable animal suppression (treat animals with standard risk)."
+    )
+
+    # --- Tier-2: Abandoned Object Detection ---
+    parser.add_argument(
+        "--enable-abandoned-object",
+        dest="enable_abandoned_object",
+        action="store_true",
+        default=True,
+        help="Enable abandoned object and unattended luggage detection (default: True)."
+    )
+    parser.add_argument(
+        "--no-abandoned-object",
+        dest="enable_abandoned_object",
+        action="store_false",
+        help="Disable abandoned object detection."
+    )
+    parser.add_argument(
+        "--abandoned-stationary-threshold",
+        type=float,
+        default=10.0,
+        help="Seconds an object must remain stationary to be considered abandoned. Default: 10.0"
+    )
+    parser.add_argument(
+        "--abandoned-owner-distance",
+        type=float,
+        default=120.0,
+        help="Distance in pixels between owner and object before considered separated. Default: 120.0"
+    )
+    parser.add_argument(
+        "--abandoned-owner-absent-threshold",
+        type=float,
+        default=5.0,
+        help="Seconds owner must be absent before triggering abandoned alert. Default: 5.0"
+    )
+
+    # --- Tier-2: Day/Night Preprocessing (CLAHE + Illumination) ---
+    parser.add_argument(
+        "--enable-illumination-auto",
+        dest="enable_illumination_auto",
+        action="store_true",
+        default=True,
+        help="Automatically detect day vs night and apply CLAHE enhancement (default: True)."
+    )
+    parser.add_argument(
+        "--no-auto-night",
+        dest="enable_illumination_auto",
+        action="store_false",
+        help="Disable automatic day/night detection."
+    )
+    parser.add_argument(
+        "--night-low-thresh",
+        type=float,
+        default=50.0,
+        help="Luminance threshold below which state switches to NIGHT. Default: 50.0"
+    )
+    parser.add_argument(
+        "--night-high-thresh",
+        type=float,
+        default=70.0,
+        help="Luminance threshold above which state switches to DAY. Default: 70.0"
+    )
+    parser.add_argument(
+        "--clahe-clip",
+        type=float,
+        default=2.0,
+        help="Contrast limit for CLAHE preprocessing. Default: 2.0"
     )
 
     return parser.parse_args()
@@ -328,8 +428,15 @@ def main():
     frame_width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # Auto-scale boundary zones to match the actual stream resolution
-    if _BOUNDARY_ENGINE_AVAILABLE and boundary_zones and frame_width > 0 and frame_height > 0:
+    # --- Initialize Zone Context Memory (Tier-2) and Auto-Scale Zones ---
+    zone_context_mgr: Optional[Any] = None
+    if _ZONE_CONTEXT_AVAILABLE:
+        zone_context_mgr = ZoneContextMemory(boundary_zones)
+        if frame_width > 0 and frame_height > 0:
+            zone_context_mgr.scale_zones_to_frame(frame_width, frame_height, ref_res=_ref_res)
+        boundary_zones = zone_context_mgr.get_all_zones()
+        logger.info(f"ZoneContextMemory: Tier-2 memory active with {len(boundary_zones)} sample/configured zones.")
+    elif _BOUNDARY_ENGINE_AVAILABLE and boundary_zones and frame_width > 0 and frame_height > 0:
         boundary_zones = scale_zones_to_frame(
             boundary_zones,
             frame_width=frame_width,
@@ -395,7 +502,58 @@ def main():
             f"approach_ratio={_risk_cfg.get('approach_band_ratio', 0.20)}"
         )
     else:
-        logger.info("Risk Engine: unavailable ?????? running without Tier-1 risk scoring.")
+        logger.info("Risk Engine: unavailable — running without Tier-1 risk scoring.")
+
+    # --- Step 5c: Initialize Tier-2 Illumination Manager ---
+    illum_cfg = _risk_cfg.get("illumination", {}) if isinstance(_risk_cfg, dict) else {}
+    low_th = float(args.night_low_thresh if args.night_low_thresh != 50.0 else illum_cfg.get("low_thresh", 50.0))
+    high_th = float(args.night_high_thresh if args.night_high_thresh != 70.0 else illum_cfg.get("high_thresh", 70.0))
+    clip_lim = float(args.clahe_clip if args.clahe_clip != 2.0 else illum_cfg.get("clahe_clip", 2.0))
+
+    illumination_mgr: Optional[Any] = None
+    if _ILLUMINATION_AVAILABLE:
+        illumination_mgr = IlluminationManager(
+            low_thresh=low_th,
+            high_thresh=high_th,
+            clahe_clip=clip_lim,
+            initial_night=args.night,
+        )
+        logger.info(
+            f"IlluminationManager: Tier-2 enabled | auto={args.enable_illumination_auto} | "
+            f"low={low_th} | high={high_th} | clahe_clip={clip_lim}"
+        )
+
+    # --- Step 5d: Initialize Tier-2 Multi-Category Abandoned Object Engine ---
+    ab_cfg = _risk_cfg.get("abandoned", {}) if isinstance(_risk_cfg, dict) else {}
+    stat_th = float(args.abandoned_stationary_threshold if args.abandoned_stationary_threshold != 10.0 else ab_cfg.get("stationary_threshold", 10.0))
+    stat_veh = float(ab_cfg.get("stationary_threshold_vehicle", 15.0))
+    stat_dev = float(ab_cfg.get("stationary_threshold_device", 12.0))
+    dist_th = float(args.abandoned_owner_distance if args.abandoned_owner_distance != 120.0 else ab_cfg.get("owner_distance_threshold", 120.0))
+    abs_th = float(args.abandoned_owner_absent_threshold if args.abandoned_owner_absent_threshold != 5.0 else ab_cfg.get("owner_absent_threshold", 5.0))
+    night_th_mult = float(ab_cfg.get("night_threshold_multiplier", 0.70))
+
+    abandoned_engine: Optional[Any] = None
+    if _ABANDONED_ENGINE_AVAILABLE and args.enable_abandoned_object:
+        abandoned_engine = AbandonedObjectEngine(
+            stationary_threshold=stat_th,
+            stationary_threshold_vehicle=stat_veh,
+            stationary_threshold_device=stat_dev,
+            owner_distance_threshold=dist_th,
+            owner_absent_threshold=abs_th,
+            night_threshold_multiplier=night_th_mult,
+        )
+        logger.info(
+            f"AbandonedObjectEngine: Tier-2 Multi-Category enabled | bag={stat_th}s | "
+            f"vehicle={stat_veh}s | device={stat_dev}s | owner_dist={dist_th}px"
+        )
+
+    # --- Step 5e: Initialize Tier-2 Zone Context Memory ---
+    zone_context_mgr: Optional[Any] = None
+    if _ZONE_CONTEXT_AVAILABLE:
+        cfg_zones = _risk_cfg.get("zones", []) if isinstance(_risk_cfg, dict) else []
+        zone_context_mgr = ZoneContextMemory(zones=cfg_zones)
+        zone_context_mgr.scale_zones_to_frame(frame_width, frame_height)
+        logger.info(f"ZoneContextMemory: Tier-2 loaded with {len(zone_context_mgr.zones)} configured zone(s).")
 
     # --- Step 6: Initialize Data Exporter ---
     exporter = DataExporter(
@@ -423,6 +581,11 @@ def main():
     last_tracks           = []    # Last known tracks (used for skipped frames)
     last_dets             = []    # Last known detections
     last_very_close_dets  = []    # Last known very-close detections (HUD only)
+
+    # --- Tier-2 State Variables ---
+    is_night_active       = args.night
+    current_brightness    = 100.0
+    last_abandoned_events = []
 
     # FPS warning throttle: only warn once every 5 seconds
     last_fps_warn_time = 0.0
@@ -519,11 +682,25 @@ def main():
             if should_process:
                 proc_id += 1
 
+                # --- Tier-2: Day/Night Illumination Preprocessing (only on processed frames) ---
+                if illumination_mgr is not None:
+                    enhanced_frame, illum_state = illumination_mgr.process_frame(
+                        frame,
+                        force_night=True if args.night else None,
+                        apply_enhancement=args.enable_illumination_auto,
+                    )
+                    is_night_active = illum_state["is_night"]
+                    current_brightness = illum_state["brightness"]
+                    det_input_frame = enhanced_frame if is_night_active else frame
+                else:
+                    det_input_frame = frame
+                    is_night_active = args.night
+
                 # ---------------------------------------------------------------
-                                # STEP A & C: DETECT & TRACK (ByteTrack or Fallback)
+                # STEP A & C: DETECT & TRACK (ByteTrack or Fallback)
                 # ---------------------------------------------------------------
                 if use_bytetrack:
-                    dets, tracks = detector.track(frame)
+                    dets, tracks = detector.track(det_input_frame)
                     people_raw  = [d for d in dets if d.get("is_person")]
                     other_dets  = [d for d in dets if not d.get("is_person")]
 
@@ -538,7 +715,7 @@ def main():
                         people_dets     = people_raw
                         very_close_dets = []
                 else:
-                    dets = detector.detect(frame)
+                    dets = detector.detect(det_input_frame)
                     people_raw  = [d for d in dets if d.get("is_person")]
                     other_dets  = [d for d in dets if not d.get("is_person")]
 
@@ -553,7 +730,26 @@ def main():
                         people_dets     = people_raw
                         very_close_dets = []
 
-                    tracks = tracker.update(people_dets)
+                    # Fallback tracker matches people and animals
+                    animal_dets = [d for d in other_dets if d.get("is_animal")]
+                    tracks = tracker.update(people_dets + animal_dets)
+
+                # ---------------------------------------------------------------
+                # TIER-2: ABANDONED OBJECT DETECTION
+                # ---------------------------------------------------------------
+                abandoned_events = []
+                if abandoned_engine is not None:
+                    safe_fps = current_fps if current_fps and current_fps > 0 else 15.0
+                    person_tracks = [t for t in tracks if t.get("is_person") and not t.get("is_animal")]
+                    abandoned_events = abandoned_engine.update(
+                        dets,
+                        person_tracks,
+                        fps=safe_fps,
+                        zone_context_mgr=zone_context_mgr,
+                        current_time=datetime.now().time(),
+                        is_night=is_night_active,
+                    )
+                last_abandoned_events = abandoned_events
 
                 last_tracks          = tracks
                 last_dets            = dets
@@ -572,6 +768,17 @@ def main():
 
                     for t in tracks:
                         tid = t["track_id"]
+
+                        # Intrusion and loitering alerts are strictly for PERSON tracks
+                        is_person = bool(t.get("is_person", False) or str(t.get("class", "")).lower() == "person")
+                        if not is_person:
+                            track_alerts[tid] = {
+                                "alert_type": "none",
+                                "severity":   "none",
+                                "zone_id":    None,
+                            }
+                            continue
+
                         cx  = int((t["bbox"][0] + t["bbox"][2]) / 2)
                         cy  = int((t["bbox"][1] + t["bbox"][3]) / 2)
 
@@ -618,7 +825,7 @@ def main():
                             del track_histories[_old_id]
 
                 # ---------------------------------------------------------------
-                # TIER-1 RISK ENGINE: behaviour + progressive risk scoring
+                # TIER-1 & TIER-2 RISK ENGINE: behaviour + progressive risk scoring
                 # ---------------------------------------------------------------
                 if risk_engine is not None:
                     alert_cards = risk_engine.update(
@@ -628,18 +835,24 @@ def main():
                         boundary_zones     = boundary_zones,
                         fps                = current_fps if current_fps and current_fps > 0 else 15.0,
                         frame_id           = proc_id,
-                        night_mode         = args.night,
+                        night_mode         = is_night_active,
                         centroid_histories = track_histories,
                         very_close_dets    = very_close_dets,
+                        current_time       = datetime.now().time(),
+                        abandoned_events   = abandoned_events,
+                        animal_suppression = args.enable_animal_suppression,
+                        zone_context_mgr   = zone_context_mgr,
                     )
                     # Mirror risk engine results into track_alerts for boundary
                     # engine drawing functions (backward compatible)
                     for tid, card in alert_cards.items():
-                        track_alerts[tid] = {
-                            "alert_type": card.get("alert_type", "intrusion"),
-                            "severity"  : card.get("severity", "high"),
-                            "zone_id"   : card.get("zone_id", "proximity"),
-                        }
+                        c_type = card.get("alert_type", "none")
+                        if c_type in ("intrusion", "loitering"):
+                            track_alerts[tid] = {
+                                "alert_type": c_type,
+                                "severity"  : card.get("severity", "high"),
+                                "zone_id"   : card.get("zone_id", "proximity"),
+                            }
 
                 # ---------------------------------------------------------------
                 # BOUNDARY ENGINE (Hook 4): annotate track dicts before export
@@ -667,27 +880,56 @@ def main():
                 )
 
                 # --- Console log summary ---
+                person_tracks = [t for t in last_tracks if t.get("is_person")]
+                animal_tracks = [t for t in last_tracks if t.get("is_animal")]
                 person_count = len(all_people)
-                other_count  = len(other_dets)
+                animal_count = len([d for d in dets if d.get("is_animal")])
+                other_count  = max(0, len(other_dets) - animal_count)
 
                 if dets or very_close_dets:
-                    parts = [
+                    p_parts = [
                         f"ID:{t['track_id']}(conf={t['confidence']:.2f})"
-                        for t in last_tracks
+                        for t in person_tracks
                     ]
                     if very_close_dets:
-                        parts.append("PROXIMITY BREACH (<30cm) [CRITICAL]")
-                    person_summary = ", ".join(parts) if parts else "no IDs yet"
-                    other_summary = ", ".join(
-                        set(d["class"] for d in other_dets)
-                    ) if other_dets else ""
+                        p_parts.append("PROXIMITY BREACH (<30cm) [CRITICAL]")
+                    person_summary = ", ".join(p_parts) if p_parts else "no IDs yet"
 
-                    logger.info(
+                    a_parts = [
+                        f"ID:{t['track_id']}({t.get('class', 'animal')},conf={t['confidence']:.2f})"
+                        for t in animal_tracks
+                    ]
+                    animal_summary = ", ".join(a_parts) if a_parts else ("present" if animal_count > 0 else "")
+
+                    non_animal_dets = [d for d in other_dets if not d.get("is_animal")]
+                    other_summary = ", ".join(
+                        set(d["class"] for d in non_animal_dets)
+                    ) if non_animal_dets else ""
+
+                    log_msg = (
                         f"Frame {frame_id:5d} | proc#{proc_id:4d} | "
                         f"FPS:{current_fps:5.1f} | "
-                        f"People:{person_count} [{person_summary}] | "
-                        f"Objects:{other_count} [{other_summary}]"
+                        f"People:{person_count} [{person_summary}]"
                     )
+                    if animal_count > 0 or animal_tracks:
+                        log_msg += f" | Animals:{max(animal_count, len(animal_tracks))} [{animal_summary}]"
+                    if other_count > 0:
+                        log_msg += f" | Objects:{other_count} [{other_summary}]"
+
+                    logger.info(log_msg)
+
+                    if last_abandoned_events:
+                        for ab_ev in last_abandoned_events:
+                            ab_cat = ab_ev.get("category", "object").upper()
+                            ab_cls = ab_ev.get("class", "object")
+                            ab_tid = ab_ev.get("track_id", f"obj_{ab_ev['object_id']}")
+                            ab_dw = ab_ev.get("stationary_time", 0.0)
+                            ab_zn = ab_ev.get("zone_name") or ab_ev.get("zone_id", "zone")
+                            ab_zt = ab_ev.get("zone_type", "none")
+                            logger.warning(
+                                f"[ABANDONED {ab_cat}] Track: {ab_tid} ({ab_cls}) | "
+                                f"Dwell: {ab_dw:.0f}s | Zone: {ab_zn} ({ab_zt})"
+                            )
                 elif frame_id % 30 == 0:
                     logger.info(
                         f"Frame {frame_id:5d} | proc#{proc_id:4d} | "
@@ -713,7 +955,30 @@ def main():
             # Draw bounding boxes and labels using the detector's draw method.
             # Merge very_close_dets into dets for drawing (yellow corner markers).
             draw_dets = list(dets) + list(very_close_dets)
+
+            # Mark abandoned detections if any
+            if last_abandoned_events:
+                ab_boxes = [ab["bbox"] for ab in last_abandoned_events]
+                for d in draw_dets:
+                    for ab_box in ab_boxes:
+                        if _bbox_iou(d["bbox"], ab_box) > 0.4:
+                            d["is_abandoned"] = True
+
             frame = detector.draw_detections(frame, draw_dets, tracks)
+
+            # --- Draw Abandoned Objects (Tier-2) ---
+            for ab_ev in last_abandoned_events:
+                ax1, ay1, ax2, ay2 = ab_ev["bbox"]
+                ab_cat = ab_ev.get("category", "bag").upper()
+                ab_cls = ab_ev.get("class", "object").upper()
+                ab_zn = ab_ev.get("zone_name") or ab_ev.get("zone_id", "Zone")
+                ab_tid = ab_ev.get("track_id", f"obj_{ab_ev['object_id']}")
+                ab_col = (0, 69, 255) if (proc_id // 5) % 2 == 0 else (0, 140, 255)
+                cv2.rectangle(frame, (ax1, ay1), (ax2, ay2), ab_col, 3)
+                ab_lbl = f"[ABANDONED {ab_cat}: {ab_cls}] {ab_tid} ({ab_ev['stationary_time']:.0f}s) [{ab_zn}]"
+                (atw, ath), _ = cv2.getTextSize(ab_lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 2)
+                cv2.rectangle(frame, (ax1, max(0, ay1 - ath - 8)), (ax1 + atw + 6, ay1), ab_col, -1)
+                cv2.putText(frame, ab_lbl, (ax1 + 3, ay1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 255, 255), 2, cv2.LINE_AA)
 
             # --- Boundary Engine (Hook 5): zone overlays + alert boxes ---
             if boundary_zones and _BOUNDARY_ENGINE_AVAILABLE:
@@ -743,12 +1008,20 @@ def main():
                 extra_info=f"{'GPU' if args.device not in ('cpu','CPU') else 'CPU'} | {args.tracker.upper()} | proc:{proc_id}"
             )
 
+            # --- Night Mode Badge (Tier-2) ---
+            if is_night_active:
+                night_badge = f" NIGHT MODE [CLAHE ACTIVE] (Bri: {current_brightness:.0f}) "
+                (nbw, nbh), _ = cv2.getTextSize(night_badge, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 2)
+                nx = max(10, frame_width - nbw - 300)
+                cv2.rectangle(frame, (nx - 4, 10), (nx + nbw + 4, 34), (40, 15, 90), -1)
+                cv2.rectangle(frame, (nx - 4, 10), (nx + nbw + 4, 34), (180, 50, 255), 1)
+                cv2.putText(frame, night_badge, (nx, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 2, cv2.LINE_AA)
+
             # --- Proximity Breach Flashing Banner ---
             has_prox = bool(very_close_dets) or any(c.get("is_too_close") for c in alert_cards.values())
             if has_prox:
                 banner_text = " [!] CRITICAL: CAMERA PROXIMITY BREACH / TAMPERING DETECTED (<30cm) "
                 banner_h = 32
-                # Pulsing red background
                 banner_bg = (0, 0, 220) if (proc_id // 6) % 2 == 0 else (0, 0, 140)
                 cv2.rectangle(frame, (0, 0), (frame_width, banner_h), banner_bg, -1)
                 (btw, bth), _ = cv2.getTextSize(banner_text, cv2.FONT_HERSHEY_SIMPLEX, 0.62, 2)
@@ -756,14 +1029,12 @@ def main():
                 cv2.putText(frame, banner_text, (bx, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
 
             # ---------------------------------------------------------------
-            # ALERT CARD PANELS (Tier-1) ?????? right side of frame
+            # ALERT CARD PANELS (Tier-1 & Tier-2) — right side of frame
             # ---------------------------------------------------------------
-            # Draw a compact alert card for each non-NORMAL track.
-            # Each card shows: ID | BEHAVIOR | ALERT_LEVEL | risk bar | reasoning
             if alert_cards:
                 _panel_x  = max(5, frame_width - 260)
                 _panel_y  = 75
-                _card_h   = 80
+                _card_h   = 82
                 _card_gap = 6
                 _card_w   = 250
 
@@ -774,12 +1045,12 @@ def main():
                     "NORMAL"    : (60,  60,   60),   # Dark gray
                 }
 
-                non_normal = [
+                _cards_to_show = [
                     (tid, card) for tid, card in alert_cards.items()
-                    if card.get("alert_level", "NORMAL") != "NORMAL"
+                    if card.get("alert_level", "NORMAL") != "NORMAL" or card.get("behavior") == "animal_presence"
                 ]
 
-                for card_idx, (tid, card) in enumerate(non_normal[:4]):  # max 4 cards
+                for card_idx, (tid, card) in enumerate(_cards_to_show[:4]):  # max 4 cards
                     cy1 = _panel_y + card_idx * (_card_h + _card_gap)
                     cy2 = cy1 + _card_h
 
@@ -787,7 +1058,11 @@ def main():
                     behav  = card.get("behavior",     "none").upper()
                     risk   = card.get("risk_score",   0.0)
                     reason = card.get("reasoning",    "")
-                    col    = _level_colors.get(level, (60, 60, 60))
+                    is_animal_supp = (card.get("behavior") == "animal_presence" or card.get("is_animal", False))
+                    if is_animal_supp:
+                        col = (200, 40, 180)  # Purple/magenta for animal suppression
+                    else:
+                        col = _level_colors.get(level, (60, 60, 60))
 
                     # Card background
                     overlay_c = frame.copy()
@@ -796,57 +1071,74 @@ def main():
 
                     # Coloured left border bar
                     cv2.rectangle(frame, (_panel_x-4, cy1), (_panel_x, cy2), col, -1)
-
-                    # Card border
                     cv2.rectangle(frame, (_panel_x-4, cy1), (_panel_x + _card_w, cy2), col, 1)
 
                     # Header: ID + LEVEL badge
-                    header = f"ID:{tid}  {level}"
+                    if is_animal_supp:
+                        header = f"ID:{tid}  ANIMAL SUPPRESSED"
+                    else:
+                        header = f"ID:{tid}  {level}"
                     cv2.putText(frame, header, (_panel_x + 4, cy1 + 16),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.52, col, 2, cv2.LINE_AA)
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.50, col, 2, cv2.LINE_AA)
 
-                    # Behaviour label
-                    cv2.putText(frame, f"Behavior: {behav}", (_panel_x + 4, cy1 + 33),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
+                    # Behaviour / Context label
+                    if is_animal_supp:
+                        animal_name = card.get("class", "animal").upper()
+                        behav_lbl = f"Animal: {animal_name} (Risk: 0)"
+                    elif card.get("context_violation"):
+                        behav_lbl = f"{behav} [CONTEXT]"
+                    elif card.get("is_abandoned"):
+                        cat = card.get("category", "object").upper()
+                        cls_name = card.get("class", "").upper()
+                        behav_lbl = f"ABANDONED {cat}: {cls_name}" if cls_name else f"ABANDONED {cat}"
+                    else:
+                        behav_lbl = f"Behavior: {behav}"
+                    cv2.putText(frame, behav_lbl, (_panel_x + 4, cy1 + 33),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 200, 200), 1, cv2.LINE_AA)
 
                     # Reasoning (truncated)
-                    reason_short = reason[:36] + "??????" if len(reason) > 36 else reason
+                    if card.get("is_abandoned"):
+                        z_info = card.get("zone_name") or card.get("zone_id", "Zone")
+                        reason_short = f"Zone: {z_info} | {card.get('dwell_sec', 0):.0f}s dwell"
+                    else:
+                        reason_short = reason[:35] + "…" if len(reason) > 35 else reason
                     cv2.putText(frame, reason_short, (_panel_x + 4, cy1 + 49),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 180, 180), 1, cv2.LINE_AA)
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.36, (180, 180, 180), 1, cv2.LINE_AA)
 
                     # Risk score progress bar
                     bar_x1  = _panel_x + 4
                     bar_x2  = _panel_x + _card_w - 4
                     bar_y   = cy1 + 62
                     bar_fill = int((bar_x2 - bar_x1) * min(risk, 100.0) / 100.0)
-                    cv2.rectangle(frame, (bar_x1, bar_y), (bar_x2, bar_y + 10), (50, 50, 50), -1)
-                    cv2.rectangle(frame, (bar_x1, bar_y), (bar_x1 + bar_fill, bar_y + 10), col, -1)
+                    cv2.rectangle(frame, (bar_x1, bar_y), (bar_x2, bar_y + 8), (50, 50, 50), -1)
+                    cv2.rectangle(frame, (bar_x1, bar_y), (bar_x1 + bar_fill, bar_y + 8), col, -1)
                     cv2.putText(frame, f"Risk: {risk:.0f}/100",
-                                (bar_x1, bar_y + 24),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 180, 180), 1, cv2.LINE_AA)
+                                (bar_x1, bar_y + 18),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.34, (180, 180, 180), 1, cv2.LINE_AA)
 
                     # Mini risk bar overlaid on the actual bounding box (if visible)
                     bbox_t = card.get("bbox")
                     if bbox_t and len(bbox_t) == 4:
                         bx1, by1, bx2, by2 = [int(v) for v in bbox_t]
-                        # Draw risk bar just above the bounding box
                         rb_y   = max(0, by1 - 12)
                         rb_len = bx2 - bx1
                         rb_fill = int(rb_len * min(risk, 100.0) / 100.0)
                         cv2.rectangle(frame, (bx1, rb_y), (bx2, rb_y + 6), (40, 40, 40), -1)
                         cv2.rectangle(frame, (bx1, rb_y), (bx1 + rb_fill, rb_y + 6), col, -1)
 
-            # Draw person count + object count on top-right
+            # Draw counts on top-right: People, Animals, Objects, Abandoned
             people_count_now = len([d for d in dets if d.get("is_person")])
+            animal_count_now = len([d for d in dets if d.get("is_animal")])
             total_count_now  = len(dets)
-            other_count_now  = total_count_now - people_count_now
+            other_count_now  = max(0, total_count_now - people_count_now - animal_count_now)
+            ab_count_now     = len(last_abandoned_events)
 
-            count_line1 = f"People: {people_count_now}"
-            count_line2 = f"Objects: {other_count_now}"
+            count_line1 = f"People: {people_count_now} | Animals: {animal_count_now}"
+            count_line2 = f"Objects: {other_count_now} | Abandoned: {ab_count_now}"
 
-            (tw1, th1), _ = cv2.getTextSize(count_line1, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-            (tw2, th2), _ = cv2.getTextSize(count_line2, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-            box_w = max(tw1, tw2) + 14
+            (tw1, th1), _ = cv2.getTextSize(count_line1, cv2.FONT_HERSHEY_SIMPLEX, 0.58, 2)
+            (tw2, th2), _ = cv2.getTextSize(count_line2, cv2.FONT_HERSHEY_SIMPLEX, 0.54, 1)
+            box_w = max(tw1, tw2) + 16
 
             cv2.rectangle(frame,
                           (frame_width - box_w - 5, 5),
@@ -854,15 +1146,15 @@ def main():
             cv2.putText(
                 frame, count_line1,
                 (frame_width - box_w, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.58,
                 (0, 255, 255) if people_count_now else (180, 180, 180),
                 2, cv2.LINE_AA
             )
             cv2.putText(
                 frame, count_line2,
-                (frame_width - box_w, 58),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                (200, 200, 100) if other_count_now else (180, 180, 180),
+                (frame_width - box_w, 56),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.54,
+                (0, 140, 255) if ab_count_now else (200, 200, 100),
                 1, cv2.LINE_AA
             )
 

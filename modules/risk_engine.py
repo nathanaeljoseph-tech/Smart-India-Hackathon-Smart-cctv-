@@ -138,6 +138,19 @@ ALERT_THRESHOLDS = [
     (0,  "NORMAL"),
 ]
 
+# --- Animal class names for suppression ---
+ANIMAL_CLASSES = {
+    "bird", "cat", "dog", "horse", "sheep",
+    "cow", "elephant", "bear", "zebra", "giraffe",
+    "teddy bear", "animal"
+}
+
+# Context penalty when unexpected object or time violation detected
+CONTEXT_PENALTY_WEIGHT: float = 30.0
+
+# Base risk for abandoned object alerts
+ABANDONED_BASE_RISK: float = 75.0
+
 
 # ===========================================================================
 # Helpers
@@ -382,18 +395,27 @@ class RiskEngine:
         engine.reset()
     """
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        config: Optional[Dict[str, Any]] = None,
+        config_path: Optional[str] = None
+    ):
         """
         Args:
             config : Optional dict loaded from boundary_config.yaml.
-                     Keys recognised:
-                       approach_band_ratio, min_track_len_for_behavior,
-                       min_loiter_seconds, too_close_height_ratio,
-                       too_close_conf_threshold,
-                       risk.base_approach, risk.base_access, risk.base_loiter,
-                       risk.decay_rate, risk.hysteresis_band, risk.night_multiplier
+            config_path : Optional path to boundary_config.yaml.
         """
         cfg = config or {}
+        if not cfg and config_path:
+            import os
+            import yaml
+            if os.path.isfile(config_path):
+                try:
+                    with open(config_path, "r") as f:
+                        cfg = yaml.safe_load(f) or {}
+                except Exception as e:
+                    logger.warning(f"Failed to load risk config from {config_path}: {e}")
+
         risk_cfg = cfg.get("risk", {}) or {}
 
         # Thresholds (can be overridden from yaml)
@@ -404,6 +426,12 @@ class RiskEngine:
         self.too_close_conf    = float(cfg.get("too_close_conf_threshold",     TOO_CLOSE_CONF_THRESH))
         self.proximity_risk    = float(cfg.get("proximity_risk_score",         98.0))
         self.proximity_enabled = bool(cfg.get("proximity_threat_enabled",       True))
+
+        # Tier-2 parameters
+        self.animal_suppression_enabled = bool(cfg.get("animal_suppression_enabled", True))
+        self.animal_suppressed_risk     = float(cfg.get("animal_suppressed_risk", 0.0))
+        self.context_penalty_weight     = float(cfg.get("context_penalty_weight", CONTEXT_PENALTY_WEIGHT))
+        self.abandoned_risk_score       = float(cfg.get("abandoned_risk_score", ABANDONED_BASE_RISK))
 
         # Risk base values
         self.risk_base = {
@@ -424,7 +452,9 @@ class RiskEngine:
         logger.info(
             f"RiskEngine ready | approach_ratio={self.approach_ratio} | "
             f"min_track_len={self.min_track_len} | min_loiter={self.min_loiter_sec}s | "
-            f"decay={self.decay_rate}/s | hysteresis={self.hysteresis_band}/frame"
+            f"decay={self.decay_rate}/s | hysteresis={self.hysteresis_band}/frame | "
+            f"animal_suppression={self.animal_suppression_enabled} | "
+            f"context_penalty={self.context_penalty_weight}"
         )
 
     # -----------------------------------------------------------------------
@@ -434,38 +464,47 @@ class RiskEngine:
     def update(
         self,
         tracks: List[Dict[str, Any]],
-        frame_h: int,
-        frame_w: int,
-        boundary_zones: List[Dict[str, Any]],
-        fps: float,
-        frame_id: int,
+        frame_h: int = 720,
+        frame_w: int = 1280,
+        boundary_zones: Optional[List[Dict[str, Any]]] = None,
+        fps: float = 15.0,
+        frame_id: int = 0,
         night_mode: bool = False,
         centroid_histories: Optional[Dict[int, List[Dict]]] = None,
         very_close_dets: Optional[List[Dict[str, Any]]] = None,
+        current_time: Optional[Any] = None,
+        abandoned_events: Optional[List[Dict[str, Any]]] = None,
+        animal_suppression: Optional[bool] = None,
+        zone_context_mgr: Optional[Any] = None,
+        boundary_alerts: Optional[Any] = None,
+        abandoned_alerts: Optional[Any] = None,
+        is_night_mode: Optional[bool] = None,
+        **kwargs,
     ) -> Dict[Any, Dict[str, Any]]:
         """
-        Main update call ΓÇö called once per processed frame.
+        Main update call — called once per processed frame.
 
         Args:
-            tracks             : List of track dicts from FallbackIOUTracker.
-                                 Each dict must contain: track_id, bbox, confidence, class.
-                                 Optionally: ema_centroid, track_age (added by tracker).
+            tracks             : List of track dicts.
             frame_h            : Frame height in pixels.
             frame_w            : Frame width in pixels.
             boundary_zones     : List of zone config dicts (from yaml).
-            fps                : Current measured FPS (used for dwell ΓåÆ seconds).
+            fps                : Current measured FPS.
             frame_id           : Current processed frame index.
-            night_mode         : If True, apply night multiplier to risk score.
-            centroid_histories : Per-track centroid history dicts from main.py
-                                 {track_id: [{\"xy\": (cx,cy), \"frame_id\": int}, ...]}.
-
-        Returns:
-            Dict mapping track_id ΓåÆ alert card dict.
-            Alert card keys:
-                track_id, bbox, centroid, ema_centroid, confidence, track_age,
-                is_too_close, behavior, risk_score, alert_level, reasoning,
-                dwell_sec, alert_type, severity, zone_id
+            night_mode         : If True, apply night multiplier.
+            centroid_histories : Per-track centroid history dicts.
+            very_close_dets    : Close-up detections.
+            current_time       : Optional datetime or time string for zone context.
+            abandoned_events   : List of active abandoned object events.
+            animal_suppression : Optional override for animal suppression.
+            zone_context_mgr   : Optional ZoneContextMemory instance.
         """
+        if is_night_mode is not None:
+            night_mode = bool(is_night_mode)
+        if abandoned_alerts is not None and abandoned_events is None:
+            abandoned_events = abandoned_alerts
+        if boundary_zones is None:
+            boundary_zones = []
         safe_fps = fps if fps and fps > 0 else 15.0
         alert_cards: Dict[int, Dict[str, Any]] = {}
 
@@ -476,10 +515,16 @@ class RiskEngine:
             if old_id not in active_ids:
                 del self._state[old_id]
 
+        suppress_animals = self.animal_suppression_enabled if animal_suppression is None else animal_suppression
+
         for t in tracks:
             tid  = t["track_id"]
             bbox = t["bbox"]
             x1, y1, x2, y2 = bbox
+            track_cls = str(t.get("class", "person")).lower()
+            is_person = bool(t.get("is_person", False) or (track_cls == "person"))
+            is_animal = bool(t.get("is_animal", False) or (track_cls in ANIMAL_CLASSES))
+            is_vehicle = bool(t.get("is_vehicle", False) or (track_cls in ("car", "truck", "bus", "motorcycle", "bicycle", "van")))
 
             # ---- 1. Update EMA centroid ----
             raw_cx = int((x1 + x2) / 2)
@@ -504,36 +549,52 @@ class RiskEngine:
             ema_cy = int(round(state["ema_cy"]))
             centroid = (ema_cx, ema_cy)
 
-            # ---- 2. Zone checks (restricted/monitor) ----
-            # Determine if the smoothed centroid is inside any restricted zone
+            # ---- 2. Zone checks (restricted/monitor/secure/no_parking) ----
             in_restricted = False
-            alert_type_be  = "none"  # from boundary_engine style logic
+            alert_type_be  = "none"
             severity_be    = "none"
             zone_id        = state.get("last_zone_id")
+            matched_zone   = None
 
-            for zone in boundary_zones:
-                z_type  = zone.get("type", "restricted").lower()
-                polygon = zone.get("polygon", [])
-                if len(polygon) < 3:
-                    continue
-
-                # Point-in-polygon check
-                try:
-                    from modules.boundary_engine import point_in_polygon
-                    inside = point_in_polygon(ema_cx, ema_cy, polygon)
-                except ImportError:
-                    inside = False
-
-                if inside:
-                    if z_type == "restricted":
+            if zone_context_mgr is not None:
+                z_ctx = zone_context_mgr.get_zone_at_point(ema_cx, ema_cy, current_time)
+                if z_ctx is not None:
+                    matched_zone = z_ctx.get("raw_zone", z_ctx)
+                    effective_type = z_ctx.get("effective_type", "monitor").lower()
+                    zone_id = z_ctx.get("zone_id")
+                    can_intrude = is_person or (is_animal and not suppress_animals)
+                    if effective_type in ("restricted", "secure") and can_intrude:
                         in_restricted = True
                         alert_type_be = "intrusion"
-                        severity_be   = "high"
-                        zone_id       = zone.get("id", "zone")
-                        break  # restricted beats monitor
+                        severity_be = "high"
                     elif alert_type_be == "none":
-                        alert_type_be = "presence"
-                        zone_id       = zone.get("id", "zone")
+                        alert_type_be = "presence" if can_intrude else "none"
+
+            if matched_zone is None:
+                for zone in boundary_zones:
+                    z_type  = zone.get("type", "restricted").lower()
+                    polygon = zone.get("polygon", [])
+                    if len(polygon) < 3:
+                        continue
+
+                    try:
+                        from modules.boundary_engine import point_in_polygon
+                        inside = point_in_polygon(ema_cx, ema_cy, polygon)
+                    except ImportError:
+                        inside = False
+
+                    if inside:
+                        matched_zone = zone
+                        can_intrude = is_person or (is_animal and not suppress_animals)
+                        if z_type in ("restricted", "secure") and can_intrude:
+                            in_restricted = True
+                            alert_type_be = "intrusion"
+                            severity_be   = "high"
+                            zone_id       = zone.get("id", "zone")
+                            break
+                        elif alert_type_be == "none":
+                            alert_type_be = "presence" if can_intrude else "none"
+                            zone_id       = zone.get("id", "zone")
 
             state["last_zone_id"] = zone_id
 
@@ -541,79 +602,152 @@ class RiskEngine:
             in_zone = in_restricted or (alert_type_be == "presence")
             if in_zone:
                 state["dwell_frames"] += 1
-                state["out_frames"]    = 0   # back inside — reset grace counter
+                state["out_frames"]    = 0
             else:
-                # Grace period: only reset dwell after DWELL_RESET_GRACE
-                # consecutive out-of-zone frames. Prevents loiter counter
-                # resetting because of a single noisy / boundary-edge frame.
                 state["out_frames"] = state.get("out_frames", 0) + 1
                 if state["out_frames"] >= DWELL_RESET_GRACE:
                     state["dwell_frames"] = 0
 
             dwell_sec = state["dwell_frames"] / safe_fps
 
-            # ---- 4. Behaviour classification ----
-            history = (centroid_histories or {}).get(tid, [])
-            behavior = classify_behavior(
-                centroid          = centroid,
-                history           = history,
-                frame_h           = frame_h,
-                in_restricted_zone= in_restricted,
-                dwell_sec         = dwell_sec,
-                min_loiter_sec    = self.min_loiter_sec,
-                approach_ratio    = self.approach_ratio,
-                min_track_len     = self.min_track_len,
-            )
-            state["behavior"] = behavior
+            # ---- 4. Context & Target Classification Check ----
+            context_violation = False
+            context_reason = ""
 
-            # ---- 5. Risk scoring ----
-            target_risk = self._compute_target_risk(
-                behavior, in_restricted, dwell_sec, night_mode, zone_id, boundary_zones
-            )
-            prev_risk = state["risk"]
-            state["risk"] = self._apply_risk_dynamics(
-                prev_risk, target_risk, behavior, safe_fps
-            )
-            risk_score  = round(min(100.0, max(0.0, state["risk"])), 1)
-            alert_level = _risk_to_alert_level(risk_score)
+            if is_animal and suppress_animals:
+                # ANIMAL SUPPRESSION: Animal detected and suppression is active
+                behavior = "animal_presence"
+                state["behavior"] = behavior
+                target_risk = self.animal_suppressed_risk
+                state["risk"] = self.animal_suppressed_risk
+                risk_score = round(self.animal_suppressed_risk, 1)
+                alert_level = "NORMAL"
+                reasoning = f"Animal detected ({track_cls}) - risk suppressed"
+                alert_type_be = "none"
+                severity_be = "none"
 
-            # Upgrade boundary_engine intrusion severity if risk is critical
-            if alert_type_be == "intrusion" and risk_score >= 75:
-                severity_be = "high"
-            elif behavior == "loiter":
-                alert_type_be = "loitering"
-                severity_be   = "medium"
+            elif not is_person and not (is_animal and not suppress_animals):
+                # NON-PERSON HANDLING: Generic objects, toys, or vehicles
+                # Non-person tracks do not trigger intrusion alerts
+                alert_type_be = "none"
+                severity_be = "none"
+                if is_vehicle:
+                    behavior = "vehicle_presence"
+                    state["behavior"] = behavior
+                    # Check zone context for vehicle
+                    if matched_zone is not None:
+                        try:
+                            from modules.boundary_engine import is_object_allowed
+                            is_ok, reason = is_object_allowed(t, matched_zone, current_time)
+                            if not is_ok:
+                                context_violation = True
+                                context_reason = reason
+                        except Exception as ce:
+                            logger.debug(f"Vehicle context check error: {ce}")
 
-            # ---- 6. Build alert card ----
-            reasoning = _build_reasoning(
-                behavior, alert_type_be, dwell_sec, zone_id, risk_score
-            )
+                    # Vehicles receive context penalty if unauthorized, but no human intrusion base risk
+                    target_risk = self.context_penalty_weight if context_violation else 0.0
+                    state["risk"] = target_risk
+                    risk_score = round(min(100.0, max(0.0, state["risk"])), 1)
+                    alert_level = _risk_to_alert_level(risk_score)
+                    reasoning = f"Vehicle detected ({track_cls})"
+                    if context_violation and context_reason:
+                        reasoning = f"{reasoning} [{context_reason}]"
+                else:
+                    # Generic objects / toys / clutter - suppress risk completely
+                    behavior = "object_presence"
+                    state["behavior"] = behavior
+                    target_risk = 0.0
+                    state["risk"] = 0.0
+                    risk_score = 0.0
+                    alert_level = "NORMAL"
+                    reasoning = f"Tracked object ({track_cls}) - risk suppressed"
 
+            else:
+                # PERSON HANDLING: Intrusion, loiter, approach behaviour classification
+                if matched_zone is not None:
+                    try:
+                        from modules.boundary_engine import is_object_allowed
+                        is_ok, reason = is_object_allowed(t, matched_zone, current_time)
+                        if not is_ok:
+                            context_violation = True
+                            context_reason = reason
+                    except Exception as ce:
+                        logger.debug(f"Context check error: {ce}")
+
+                # Standard behaviour classification
+                history = (centroid_histories or {}).get(tid, [])
+                behavior = classify_behavior(
+                    centroid          = centroid,
+                    history           = history,
+                    frame_h           = frame_h,
+                    in_restricted_zone= in_restricted,
+                    dwell_sec         = dwell_sec,
+                    min_loiter_sec    = self.min_loiter_sec,
+                    approach_ratio    = self.approach_ratio,
+                    min_track_len     = self.min_track_len,
+                )
+                state["behavior"] = behavior
+
+                # Risk scoring with context penalty & night multiplier
+                target_risk = self._compute_target_risk(
+                    behavior,
+                    in_restricted,
+                    dwell_sec,
+                    night_mode,
+                    zone_id,
+                    boundary_zones,
+                    context_penalty=self.context_penalty_weight if context_violation else 0.0,
+                )
+                prev_risk = state["risk"]
+                state["risk"] = self._apply_risk_dynamics(
+                    prev_risk, target_risk, behavior, safe_fps
+                )
+                risk_score  = round(min(100.0, max(0.0, state["risk"])), 1)
+                alert_level = _risk_to_alert_level(risk_score)
+
+                if alert_type_be == "intrusion" and risk_score >= 75:
+                    severity_be = "high"
+                elif behavior == "loiter":
+                    alert_type_be = "loitering"
+                    severity_be   = "medium"
+
+                reasoning = _build_reasoning(
+                    behavior, alert_type_be, dwell_sec, zone_id, risk_score
+                )
+                if context_violation and context_reason:
+                    reasoning = f"{reasoning} [{context_reason}]"
+
+            # Build alert card
             card: Dict[str, Any] = {
                 # Identity
-                "track_id"   : tid,
-                "bbox"       : bbox,
-                "centroid"   : [raw_cx, raw_cy],
-                "ema_centroid": [ema_cx, ema_cy],
-                "confidence" : t.get("confidence", 0.0),
-                "track_age"  : state["track_age"],
-                "is_too_close": t.get("is_too_close", False),
+                "track_id"         : tid,
+                "bbox"             : bbox,
+                "centroid"         : [raw_cx, raw_cy],
+                "ema_centroid"     : [ema_cx, ema_cy],
+                "confidence"       : t.get("confidence", 0.0),
+                "track_age"        : state["track_age"],
+                "is_too_close"     : t.get("is_too_close", False),
+                "class"            : track_cls,
+                "is_animal"        : is_animal,
+                # Context info
+                "context_violation": context_violation,
+                "context_reason"   : context_reason,
                 # Behaviour & risk
-                "behavior"   : behavior,
-                "risk_score" : risk_score,
-                "alert_level": alert_level,
-                "reasoning"  : reasoning,
-                "dwell_sec"  : round(dwell_sec, 1),
+                "behavior"         : behavior,
+                "risk_score"       : risk_score,
+                "alert_level"      : alert_level,
+                "reasoning"        : reasoning,
+                "dwell_sec"        : round(dwell_sec, 1),
                 # Boundary engine compat fields
-                "alert_type" : alert_type_be,
-                "severity"   : severity_be,
-                "zone_id"    : zone_id,
+                "alert_type"       : alert_type_be,
+                "severity"         : severity_be,
+                "zone_id"          : zone_id,
             }
 
             alert_cards[tid] = card
 
-            # Log non-normal alerts
-            if alert_level != "NORMAL":
+            if alert_level != "NORMAL" and not (is_animal and suppress_animals):
                 logger.info(
                     f"RISK | track_id={tid} | behavior={behavior.upper()} | "
                     f"risk={risk_score:.0f} | level={alert_level} | "
@@ -622,7 +756,11 @@ class RiskEngine:
 
         # Process any very-close detections (macro close-ups e.g. 15-30cm / camera tampering)
         if very_close_dets and self.proximity_enabled:
+            has_animal_in_scene = any(t.get("is_animal") for t in tracks)
             for idx, vc_det in enumerate(very_close_dets):
+                # Suppress proximity breach if detection is an animal or animal in scene
+                if vc_det.get("is_animal") or (has_animal_in_scene and suppress_animals and not vc_det.get("is_person")):
+                    continue
                 vc_id = f"PROX-{idx+1}"
                 vx1, vy1, vx2, vy2 = vc_det["bbox"]
                 vcx = int((vx1 + vx2) / 2)
@@ -650,6 +788,78 @@ class RiskEngine:
                     f"CRITICAL | Subject <30cm from camera!"
                 )
 
+        # Process abandoned object alerts (Tier-2 Multi-Category)
+        if abandoned_events:
+            for ab_ev in abandoned_events:
+                ab_id = f"ABANDONED-{ab_ev['object_id']}"
+                ab_cx, ab_cy = ab_ev["centroid"]
+                category = ab_ev.get("category", "bag")
+                cls_name = ab_ev.get("class", "object")
+                ab_zone_id = ab_ev.get("zone_id")
+                ab_zone_name = ab_ev.get("zone_name", "Zone")
+                effective_zone_type = str(ab_ev.get("zone_type", "none")).lower()
+
+                if not ab_zone_id:
+                    for zone in boundary_zones:
+                        poly = zone.get("polygon", [])
+                        if len(poly) >= 3:
+                            try:
+                                from modules.boundary_engine import point_in_polygon
+                                if point_in_polygon(ab_cx, ab_cy, poly):
+                                    ab_zone_id = zone.get("id")
+                                    ab_zone_name = zone.get("name", ab_zone_id)
+                                    effective_zone_type = str(zone.get("type", "restricted")).lower()
+                                    break
+                            except Exception:
+                                pass
+
+                is_critical_zone = effective_zone_type in ("restricted", "secure", "no_parking")
+
+                # Category-based base risk:
+                # - Bags/Boxes in restricted/secure zones: 85.0 (CRITICAL/HIGH)
+                # - Vehicles in restricted/no_parking zones: 80.0 (HIGH/CRITICAL)
+                # - Small devices in secure zones: 60.0 (HIGH/SUSPICIOUS)
+                # - Outside critical zones: baseline proportionate risk
+                if category == "bag":
+                    base_ab_risk = 85.0 if is_critical_zone else 65.0
+                elif category == "vehicle":
+                    base_ab_risk = 80.0 if is_critical_zone else 50.0
+                elif category == "device":
+                    base_ab_risk = 60.0 if is_critical_zone else 40.0
+                else:
+                    base_ab_risk = self.abandoned_risk_score
+
+                is_night_event = bool(night_mode or ab_ev.get("is_night", False))
+                if is_night_event:
+                    base_ab_risk *= self.night_mult
+
+                ab_risk = round(min(100.0, max(10.0, base_ab_risk)), 1)
+                ab_level = _risk_to_alert_level(ab_risk)
+
+                alert_cards[ab_id] = {
+                    "track_id"     : ab_id,
+                    "object_id"    : ab_ev["object_id"],
+                    "bbox"         : ab_ev["bbox"],
+                    "centroid"     : [ab_cx, ab_cy],
+                    "ema_centroid" : [ab_cx, ab_cy],
+                    "confidence"   : ab_ev.get("confidence", 0.85),
+                    "track_age"    : int(ab_ev.get("stationary_time", 10.0) * safe_fps),
+                    "is_too_close" : False,
+                    "is_abandoned" : True,
+                    "category"     : category,
+                    "class"        : cls_name,
+                    "behavior"     : "ABANDONED_OBJECT",
+                    "risk_score"   : ab_risk,
+                    "alert_level"  : ab_level,
+                    "reasoning"    : ab_ev.get("reasoning", f"Unattended {category} ({cls_name})"),
+                    "dwell_sec"    : ab_ev.get("stationary_time", 0.0),
+                    "alert_type"   : "intrusion" if is_critical_zone else "presence",
+                    "severity"     : "high" if ab_risk >= 75 else "medium",
+                    "zone_id"      : ab_zone_id,
+                    "zone_name"    : ab_zone_name,
+                    "zone_type"    : effective_zone_type,
+                }
+
         return alert_cards
 
     # -----------------------------------------------------------------------
@@ -664,23 +874,30 @@ class RiskEngine:
         night_mode: bool,
         zone_id: Optional[str],
         boundary_zones: List[Dict[str, Any]],
+        context_penalty: float = 0.0,
     ) -> float:
         """
         Compute the DESIRED risk score given current behaviour and context.
         The actual score may differ due to hysteresis and decay.
         """
         base = self.risk_base.get(behavior, 0.0)
+        if base == 0.0 and in_restricted:
+            base = self.risk_base.get("access", 40.0)
 
-        # Zone multiplier (restricted zones get full weight)
+        # Zone multiplier and zone-specific night multiplier
         zone_mult = 1.0
+        zone_night_mult = self.night_mult
+
         if zone_id:
             for zone in boundary_zones:
                 if zone.get("id") == zone_id:
                     z_type    = zone.get("type", "restricted").lower()
                     zone_mult = ZONE_MULTIPLIER.get(z_type, 1.0)
+                    if "night_multiplier" in zone:
+                        zone_night_mult = float(zone["night_multiplier"])
                     break
 
-        target = base * zone_mult
+        target = base * zone_mult + context_penalty
 
         # Loiter bonus: each second of dwell beyond the base adds more risk
         if behavior == "loiter" and dwell_sec > 0:
@@ -688,7 +905,7 @@ class RiskEngine:
 
         # Night multiplier
         if night_mode and target > 0:
-            target *= self.night_mult
+            target *= zone_night_mult
 
         return min(100.0, target)
 
@@ -705,14 +922,13 @@ class RiskEngine:
         Hysteresis: risk can only FALL by at most HYSTERESIS_BAND per frame.
         This prevents rapid flickering when a detection briefly disappears.
 
-        Decay: when behaviour is "none", subtract DECAY_RATE/fps per frame.
+        Decay: when behaviour is "none" and target_risk is 0, subtract DECAY_RATE/fps per frame.
         Risk never decays below 0.
         """
-        if behavior == "none":
+        if (behavior == "none" or behavior == "animal_presence") and target_risk <= 0.0:
             # Decay mode: slowly bring risk down
             decay_per_frame = self.decay_rate / fps
             new_risk = max(0.0, prev_risk - decay_per_frame)
-            # Still apply hysteresis cap on how fast it can drop
         else:
             # Drive toward target; cap the drop by hysteresis_band
             if target_risk >= prev_risk:

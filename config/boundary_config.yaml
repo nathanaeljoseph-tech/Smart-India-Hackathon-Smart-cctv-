@@ -75,10 +75,40 @@ risk:
   night_multiplier: 1.30
 
 # ---------------------------------------------------------------------------
+# Tier-2 Enhancements Configuration
+# ---------------------------------------------------------------------------
+
+# Feature 1: Animal-vs-Human Suppression
+animal_suppression_enabled: true
+animal_suppressed_risk: 0.0
+
+# Feature 2: Zone Context Memory penalty
+context_penalty_weight: 30.0
+
+# Feature 3: Abandoned Object Detection
+abandoned:
+  enabled: true
+  stationary_threshold: 10.0          # Base seconds object must remain stationary (bags)
+  stationary_threshold_vehicle: 15.0 # Base seconds for vehicles
+  stationary_threshold_device: 12.0  # Base seconds for small devices
+  owner_distance_threshold: 120.0     # Pixels before owner is considered separated
+  owner_absent_threshold: 5.0         # Seconds owner absent before triggering
+  abandoned_risk_score: 75.0          # Base risk score for abandoned objects
+  night_threshold_multiplier: 0.70    # Stricter dwell threshold multiplier at night (faster alert)
+
+# Feature 4: Illumination & Day/Night Preprocessing
+illumination:
+  auto_night: true
+  low_thresh: 50.0                # Luminance < 50 triggers NIGHT
+  high_thresh: 70.0               # Luminance > 70 triggers DAY
+  clahe_clip: 2.0
+  clahe_grid: [8, 8]
+
+# ---------------------------------------------------------------------------
 # Zone definitions
 # ---------------------------------------------------------------------------
 zones:
-  # ΓöÇΓöÇ Zone 1: Main restricted perimeter (top 80 % of frame) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+  # ── Zone 1: Main restricted perimeter (top 80 % of frame) ───────────────
   # Any person entering this zone triggers an immediate intrusion alert.
   - id: perimeter
     type: restricted
@@ -88,9 +118,17 @@ zones:
       - [1280, 576]   # 576 = 720 * 0.80
       - [0,    576]
     min_loiter_seconds: 8
+    allowed_objects: ["person"]
+    time_windows: ["06:00-22:00"]
+    time_rules:
+      - time_window: "22:00-06:00"
+        override_type: secure
+        override_expected_objects: []
+        description: "Overnight strict lockdown"
+    night_multiplier: 1.40
 
-  # ΓöÇΓöÇ Zone 2: Approach band (bottom 20 % of frame) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-  # Monitored but not restricted ΓÇö presence alone does not trigger an alert.
+  # ── Zone 2: Approach band (bottom 20 % of frame) ─────────────────────────
+  # Monitored but not restricted — presence alone does not trigger an alert.
   # The risk engine uses this band to detect "approaching" behaviour.
   # min_loiter_seconds is set very high so loitering never fires here.
   - id: approach_band
@@ -101,3 +139,7 @@ zones:
       - [1280, 720]
       - [0,    720]
     min_loiter_seconds: 9999
+    allowed_objects: ["person", "animal"]
+    time_rules: []
+    night_multiplier: 1.20
+

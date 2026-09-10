@@ -32,9 +32,130 @@ Date   : 2026-09-08
 import cv2
 import numpy as np
 import logging
-from typing import List, Tuple, Dict, Any, Optional
+from datetime import datetime, time as dtime
+from typing import List, Tuple, Dict, Any, Optional, Union
 
 logger = logging.getLogger("amst_border_net.boundary_engine")
+
+
+# ===========================================================================
+# Zone Context & Time Window Helpers (Tier-2)
+# ===========================================================================
+
+def parse_time_str(t_val: Union[str, dtime, datetime]) -> dtime:
+    """Parse time string 'HH:MM' or 'HH:MM:SS' into datetime.time object."""
+    if isinstance(t_val, datetime):
+        return t_val.time()
+    if isinstance(t_val, dtime):
+        return t_val
+    t_str = str(t_val).strip()
+    for fmt in ("%H:%M", "%H:%M:%S"):
+        try:
+            return datetime.strptime(t_str, fmt).time()
+        except ValueError:
+            pass
+    # Fallback to noon if parsing fails
+    return dtime(12, 0)
+
+
+def is_time_in_windows(
+    current_time: Optional[Union[str, dtime, datetime]],
+    time_windows: Optional[List[str]],
+) -> bool:
+    """
+    Check whether current_time falls inside ANY of the configured time windows.
+
+    Format of window: 'HH:MM-HH:MM' e.g. '06:00-18:00' or overnight '22:00-04:00'.
+    If time_windows is empty or None, all times are considered permitted.
+    """
+    if not time_windows:
+        return True
+
+    now_t = parse_time_str(current_time) if current_time is not None else datetime.now().time()
+
+    for win in time_windows:
+        if not win or "-" not in win:
+            continue
+        try:
+            start_s, end_s = win.split("-", 1)
+            t_start = parse_time_str(start_s)
+            t_end = parse_time_str(end_s)
+
+            if t_start <= t_end:
+                # Normal same-day window e.g. 06:00 - 18:00
+                if t_start <= now_t <= t_end:
+                    return True
+            else:
+                # Overnight window e.g. 22:00 - 04:00
+                if now_t >= t_start or now_t <= t_end:
+                    return True
+        except Exception as e:
+            logger.warning(f"Error parsing time window '{win}': {e}")
+            continue
+
+    return False
+
+
+def get_allowed_objects(
+    zone: Dict[str, Any],
+    current_time: Optional[Union[str, dtime, datetime]] = None,
+) -> Optional[List[str]]:
+    """
+    Return list of allowed object classes for this zone.
+    Returns None if no restrictions are specified (all objects allowed).
+    """
+    allowed = zone.get("allowed_objects")
+    if allowed is None:
+        return None
+    return [str(obj).lower() for obj in allowed]
+
+
+def is_object_allowed(
+    track_or_class: Union[str, Dict[str, Any]],
+    zone: Dict[str, Any],
+    current_time: Optional[Union[str, dtime, datetime]] = None,
+) -> Tuple[bool, str]:
+    """
+    Validate whether an object type and the current time of day are permitted
+    in the specified zone.
+
+    Returns:
+        (is_allowed: bool, reason: str)
+    """
+    # 1. Extract class name
+    if isinstance(track_or_class, dict):
+        obj_class = str(track_or_class.get("class", "unknown")).lower()
+    else:
+        obj_class = str(track_or_class).lower()
+
+    zid = zone.get("id", "zone")
+
+    # 2. Check allowed object types
+    allowed_objs = get_allowed_objects(zone, current_time)
+    if allowed_objs is not None:
+        # Check direct match or wildcard/category match
+        is_type_ok = False
+        for allowed in allowed_objs:
+            if allowed == obj_class:
+                is_type_ok = True
+                break
+            if allowed == "vehicle" and obj_class in ("car", "truck", "bus", "motorcycle", "bicycle"):
+                is_type_ok = True
+                break
+            if allowed == "animal" and obj_class in ("dog", "cat", "cow", "horse", "sheep", "bird"):
+                is_type_ok = True
+                break
+
+        if not is_type_ok:
+            return (False, f"Unexpected object type '{obj_class}' in zone '{zid}'")
+
+    # 3. Check time windows
+    time_windows = zone.get("time_windows")
+    if time_windows and not is_time_in_windows(current_time, time_windows):
+        win_str = ", ".join(time_windows)
+        return (False, f"Restricted time window in zone '{zid}' (allowed: {win_str})")
+
+    return (True, "Allowed")
 
 
 # ---------------------------------------------------------------------------

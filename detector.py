@@ -98,6 +98,7 @@ _CATEGORY_MAP = {
     14: _ANIMAL, 15: _ANIMAL, 16: _ANIMAL, 17: _ANIMAL,
     18: _ANIMAL, 19: _ANIMAL, 20: _ANIMAL, 21: _ANIMAL,
     22: _ANIMAL, 23: _ANIMAL,
+    77: _ANIMAL,  # teddy bear / plush animal
     # Bags / Luggage (security relevant)
     24: _BAG, 26: _BAG, 28: _BAG, 25: _BAG,
     # Weapons / Dangerous items
@@ -124,6 +125,12 @@ for cid in COCO_CLASSES:
 
 # Person class constant
 PERSON_CLASS_ID = 0
+
+# Animal class IDs (bird, cat, dog, horse, sheep, cow, elephant, bear, zebra, giraffe, teddy bear)
+ANIMAL_CLASS_IDS = {14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 77}
+
+# Luggage / Bag class IDs (backpack, umbrella, handbag, suitcase)
+LUGGAGE_CLASS_IDS = {24, 25, 26, 28}
 
 
 class YOLODetector:
@@ -262,8 +269,8 @@ class YOLODetector:
         Run YOLO + ByteTrack in a single model.track() call.
 
         Returns (detections, tracks) where:
-          - detections : same format as detect() ? all classes, full HUD info
-          - tracks     : person-only list with stable ByteTrack IDs + EMA centroids
+          - detections : same format as detect() — all classes, full HUD info
+          - tracks     : person, animal, vehicle tracks with ByteTrack IDs + EMA centroids
         """
         if self.model is None:
             self.logger.error("track() called before load_model()!")
@@ -274,10 +281,11 @@ class YOLODetector:
         EMA_ALPHA = 0.35  # smoother than FallbackIOUTracker for ByteTrack
 
         try:
+            infer_conf = min(self.conf_threshold, 0.25)
             results = self.model.track(
                 frame,
                 imgsz   = self.input_size,
-                conf    = self.conf_threshold,
+                conf    = infer_conf,
                 iou     = 0.5,
                 persist = True,               # keeps Kalman state across frames
                 tracker = self._tracker_type,
@@ -285,21 +293,8 @@ class YOLODetector:
                 verbose = False,
             )
 
-            # All-class detections for HUD (reuse existing parse + close-range logic)
+            # All-class detections for HUD
             detections = self._parse_results(results, frame.shape)
-            h, w = frame.shape[:2]
-            people_found = any(d.get("is_person") for d in detections)
-            for d in detections:
-                if not d.get("is_person"):
-                    x1, y1, x2, y2 = d["bbox"]
-                    bh = (y2 - y1) / max(1, h)
-                    ar = d.get("bbox_area_ratio", 0.0)
-                    if (bh >= 0.40 or ar >= 0.15) and d.get("class") in (
-                            "tie", "backpack", "suitcase", "umbrella"):
-                        d["is_person"] = True; d["class"] = "person"
-                        d["class_id"] = 0; people_found = True
-
-            # Person tracks with ByteTrack IDs
             tracks = self._parse_tracks(results, frame.shape)
 
             # Update EMA centroids per track
@@ -330,7 +325,7 @@ class YOLODetector:
             return self.detect(frame), []
 
     def _parse_tracks(self, results, shape) -> list:
-        """Extract ByteTrack person tracks from model.track() results."""
+        """Extract ByteTrack tracks for people, animals, and vehicles from model.track() results."""
         tracks = []
         result = results[0]
         if result.boxes is None or len(result.boxes) == 0:
@@ -340,10 +335,9 @@ class YOLODetector:
 
         h, w = shape[:2]
         for box in result.boxes:
-            if int(box.cls[0]) != 0:   # person only
-                continue
             if box.id is None:
                 continue
+            cls_id   = int(box.cls[0])
             track_id = int(box.id[0])
             conf     = float(box.conf[0])
             x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
@@ -353,13 +347,30 @@ class YOLODetector:
                 continue
             cx = (x1 + x2) // 2
             cy = (y1 + y2) // 2
+            cls_name = COCO_CLASSES.get(cls_id, f"obj_{cls_id}")
+            is_person = (cls_id == PERSON_CLASS_ID)
+            is_animal = (cls_id in ANIMAL_CLASS_IDS)
+            is_vehicle = (cls_id in {1, 2, 3, 5, 7})  # bicycle, car, motorcycle, bus, truck
+
+            # Only track persons, animals, and vehicles in persistent tracker
+            # Clutter, tableware, indoor objects are displayed via dets but not tracked
+            if not is_person and not is_animal and not is_vehicle:
+                continue
+
+            # Class-aware confidence gate: animals allow down to 0.25 (critical for screens/webcams)
+            min_conf = 0.25 if is_animal else (min(self.conf_threshold, 0.35) if is_person else self.conf_threshold)
+            if conf < min_conf:
+                continue
+
             tracks.append({
                 "track_id"    : track_id,
                 "bbox"        : [x1, y1, x2, y2],
                 "confidence"  : conf,
-                "class"       : "person",
-                "class_id"    : 0,
-                "is_person"   : True,
+                "class"       : cls_name,
+                "class_id"    : cls_id,
+                "is_person"   : is_person,
+                "is_animal"   : is_animal,
+                "is_vehicle"  : is_vehicle,
                 "track_age"   : 1,
                 "ema_centroid": [cx, cy],   # updated after EMA calc
                 "_raw_cx"     : cx,
@@ -396,13 +407,12 @@ class YOLODetector:
             return []
 
         try:
-            # Run YOLO inference
-            # classes=None ΓåÆ detect all 80 COCO classes
-            # classes=[0,2,...] ΓåÆ detect only those specific class IDs
+            # Run YOLO inference down to 0.25 so animals on screens/mobile devices are caught
+            infer_conf = min(self.conf_threshold, 0.25)
             results = self.model(
                 frame,
                 imgsz   = self.input_size,
-                conf    = self.conf_threshold,
+                conf    = infer_conf,
                 iou     = 0.5,               # NMS overlap threshold
                 classes = self.target_classes,  # None = all classes
                 device  = self.device,
@@ -527,17 +537,53 @@ class YOLODetector:
             # Get the color for this class
             color = CLASS_COLORS.get(class_id, _DEFAULT)
 
+            is_person = (class_id == PERSON_CLASS_ID)
+            is_animal = (class_id in ANIMAL_CLASS_IDS)
+
+            # Class-aware confidence gate:
+            # - Animals: allow down to 0.25 (critical for screens/mobile devices/webcams)
+            # - People: min(conf_threshold, 0.35)
+            # - Generic objects/clutter: full conf_threshold
+            min_conf = 0.25 if is_animal else (min(self.conf_threshold, 0.35) if is_person else self.conf_threshold)
+            if confidence < min_conf:
+                continue
+
             detection = {
                 "bbox"           : [x1, y1, x2, y2],
                 "confidence"     : round(confidence, 4),
                 "class"          : label,          # e.g. "person", "car", "scissors"
                 "class_id"       : class_id,       # COCO integer ID
-                "is_person"      : (class_id == PERSON_CLASS_ID),
+                "is_person"      : is_person,
+                "is_animal"      : is_animal,
                 "color"          : color,          # BGR tuple for drawing
                 "is_too_close"   : False,          # set by filter_too_close()
                 "bbox_area_ratio": round(((x2-x1)*(y2-y1)) / max(1, h*w), 4),
             }
             detections.append(detection)
+
+        # Screen / Phone overlap check:
+        # If an animal is detected on a phone/screen, suppress the redundant enclosing 'cell phone' or 'tv' box
+        animal_boxes = [d["bbox"] for d in detections if d.get("is_animal")]
+        if animal_boxes:
+            filtered = []
+            for d in detections:
+                if d.get("class") in ("cell phone", "laptop", "tv"):
+                    px1, py1, px2, py2 = d["bbox"]
+                    phone_area = max(1, (px2 - px1) * (py2 - py1))
+                    has_animal_inside = False
+                    for ax1, ay1, ax2, ay2 in animal_boxes:
+                        ix1 = max(px1, ax1); iy1 = max(py1, ay1)
+                        ix2 = min(px2, ax2); iy2 = min(py2, ay2)
+                        if ix2 > ix1 and iy2 > iy1:
+                            inter_area = (ix2 - ix1) * (iy2 - iy1)
+                            if inter_area / phone_area > 0.20 or inter_area / max(1, (ax2 - ax1) * (ay2 - ay1)) > 0.35:
+                                has_animal_inside = True
+                                break
+                    if not has_animal_inside:
+                        filtered.append(d)
+                else:
+                    filtered.append(d)
+            detections = filtered
 
         return detections
 
@@ -551,21 +597,20 @@ class YOLODetector:
         Draw bounding boxes and labels on the frame.
 
         Visual design:
-          - PEOPLE  : Thick (3px) cyan box + "PERSON | ID:X | 0.89"
-          - OTHERS  : Thin (2px) category-colored box + "scissors | 0.74"
-          - Centroid: Red dot on people only (for tracking visualization)
+          - PEOPLE   : Thick (3px) cyan box + "PERSON | ID:X | 0.89"
+          - ANIMALS  : Distinct purple box + "[ANIMAL: dog] | ID:X | 0.85"
+          - ABANDONED: Thick orange-red box + "[ABANDONED BACKPACK]"
+          - OTHERS   : Thin (2px) category-colored box + "car | 0.74"
+          - Centroid : Red dot on people only (for tracking visualization)
 
         Args:
             frame      : BGR image. Modified in-place and returned.
             detections : List of dicts from detect().
             tracks     : Optional track list from FallbackIOUTracker.
-                         Used to show track IDs on people.
 
         Returns:
             The annotated frame.
         """
-        # Build a lookup from bbox ΓåÆ track_id (for people only)
-        # We match by IoU overlap since tracked bbox may differ slightly
         track_id_map: Dict[tuple, int] = {}
         if tracks:
             for t in tracks:
@@ -578,24 +623,36 @@ class YOLODetector:
             label     = det["class"]
             conf      = det["confidence"]
             is_person = det["is_person"]
-            color     = det["color"]
+            is_animal = det.get("is_animal", class_id in ANIMAL_CLASS_IDS)
+            is_abandoned = det.get("is_abandoned", False)
+            color     = (0, 100, 255) if is_abandoned else det["color"]
 
-            # --- Box thickness: people get thicker border to stand out ---
-            thickness = 3 if is_person else 2
+            # --- Box thickness ---
+            thickness = 3 if (is_person or is_abandoned) else 2
 
             # --- Draw bounding box ---
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
 
             # --- Build label text ---
-            if is_person and tracks:
-                # Find track ID for this person
-                tid = self._find_track_id(det["bbox"], tracks)
+            tid = None
+            if (is_person or is_animal) and tracks:
+                tid = track_id_map.get(tuple(det["bbox"]))
+                if tid is None:
+                    tid = self._find_track_id(det["bbox"], tracks)
+
+            if is_person:
                 if tid is not None:
                     text = f"PERSON | ID:{tid} | {conf:.2f}"
                 else:
                     text = f"PERSON | {conf:.2f}"
+            elif is_animal:
+                if tid is not None:
+                    text = f"[ANIMAL: {label}] | ID:{tid} | {conf:.2f}"
+                else:
+                    text = f"[ANIMAL: {label}] | {conf:.2f}"
+            elif is_abandoned:
+                text = f"[ABANDONED {label.upper()}] | {conf:.2f}"
             else:
-                # All other objects: just show their name + confidence
                 text = f"{label} | {conf:.2f}"
 
             # --- Draw label background rectangle ---

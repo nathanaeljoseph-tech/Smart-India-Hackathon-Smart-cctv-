@@ -151,19 +151,30 @@ class ByteTrackWrapper:
 
                         track_id = int(box.id[0])
                         class_id = int(box.cls[0])
+                        is_person = (class_id == 0)
+                        is_animal = (class_id in {14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 77})
 
-                        # Only keep person class
-                        if class_id != 0:
+                        # Keep people and animals
+                        if not is_person and not is_animal:
                             continue
 
                         confidence = float(box.conf[0])
                         x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
 
+                        try:
+                            from detector import COCO_CLASSES
+                            cls_name = COCO_CLASSES.get(class_id, "person" if is_person else "animal")
+                        except Exception:
+                            cls_name = "person" if is_person else "animal"
+
                         track = {
                             "track_id"  : track_id,
                             "bbox"      : [x1, y1, x2, y2],
                             "confidence": round(confidence, 4),
-                            "class"     : "person",
+                            "class"     : cls_name,
+                            "class_id"  : class_id,
+                            "is_person" : is_person,
+                            "is_animal" : is_animal,
                         }
                         tracks.append(track)
 
@@ -326,6 +337,10 @@ class FallbackIOUTracker:
 
             self.active_tracks[tid]["bbox"]        = det["bbox"]
             self.active_tracks[tid]["confidence"]  = det["confidence"]
+            self.active_tracks[tid]["class"]       = det.get("class", "person")
+            self.active_tracks[tid]["class_id"]    = det.get("class_id", 0)
+            self.active_tracks[tid]["is_person"]   = det.get("is_person", True)
+            self.active_tracks[tid]["is_animal"]   = det.get("is_animal", False)
             self.active_tracks[tid]["lost_frames"] = 0  # Reset lost counter
             self.active_tracks[tid]["ema_cx"]      = new_ema_cx
             self.active_tracks[tid]["ema_cy"]      = new_ema_cy
@@ -336,7 +351,10 @@ class FallbackIOUTracker:
                 "track_id"     : tid,
                 "bbox"         : det["bbox"],
                 "confidence"   : det["confidence"],
-                "class"        : "person",
+                "class"        : det.get("class", "person"),
+                "class_id"     : det.get("class_id", 0),
+                "is_person"    : det.get("is_person", True),
+                "is_animal"    : det.get("is_animal", False),
                 "track_age"    : self.active_tracks[tid]["track_age"],
                 "ema_centroid" : [int(round(new_ema_cx)), int(round(new_ema_cy))],
             })
@@ -344,7 +362,7 @@ class FallbackIOUTracker:
         # ---- Step 4: Create new tracks for unmatched detections ----
         for d_idx, det in enumerate(detections):
             if d_idx not in matched_det_idxs:
-                # This detection has no matching track ΓåÆ new person
+                # This detection has no matching track — new track
                 new_id = self.next_id
                 self.next_id += 1
                 raw_cx = int((det["bbox"][0] + det["bbox"][2]) / 2)
@@ -352,6 +370,10 @@ class FallbackIOUTracker:
                 self.active_tracks[new_id] = {
                     "bbox"        : det["bbox"],
                     "confidence"  : det["confidence"],
+                    "class"       : det.get("class", "person"),
+                    "class_id"    : det.get("class_id", 0),
+                    "is_person"   : det.get("is_person", True),
+                    "is_animal"   : det.get("is_animal", False),
                     "lost_frames" : 0,
                     "track_age"   : 1,
                     "ema_cx"      : float(raw_cx),
@@ -361,7 +383,10 @@ class FallbackIOUTracker:
                     "track_id"     : new_id,
                     "bbox"         : det["bbox"],
                     "confidence"   : det["confidence"],
-                    "class"        : "person",
+                    "class"        : det.get("class", "person"),
+                    "class_id"     : det.get("class_id", 0),
+                    "is_person"    : det.get("is_person", True),
+                    "is_animal"    : det.get("is_animal", False),
                     "track_age"    : 1,
                     "ema_centroid" : [raw_cx, raw_cy],
                 })
