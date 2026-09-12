@@ -106,6 +106,43 @@ try:
 except ImportError:
     _ZONE_CONTEXT_AVAILABLE = False
 
+# --- Tier-3 Modules: TCN Temporal, VLM, LLM, Re-ID, Fence Tamper, VMS API ---
+try:
+    from modules.temporal_behavior import TemporalBehaviorModel
+    _TEMPORAL_MODEL_AVAILABLE = True
+except ImportError:
+    _TEMPORAL_MODEL_AVAILABLE = False
+
+try:
+    from modules.vlm_client import VLMClient
+    _VLM_AVAILABLE = True
+except ImportError:
+    _VLM_AVAILABLE = False
+
+try:
+    from modules.llm_client import LLMClient
+    _LLM_AVAILABLE = True
+except ImportError:
+    _LLM_AVAILABLE = False
+
+try:
+    from modules.reid_fusion import ReIDFusionEngine
+    _REID_AVAILABLE = True
+except ImportError:
+    _REID_AVAILABLE = False
+
+try:
+    from modules.tamper_detector import FenceTamperDetector, draw_fence_tamper_overlay, FenceTamperStatus
+    _FENCE_TAMPER_AVAILABLE = True
+except ImportError:
+    _FENCE_TAMPER_AVAILABLE = False
+
+try:
+    from modules.vms_api import VMSServerThread, state_manager
+    _VMS_API_AVAILABLE = True
+except ImportError:
+    _VMS_API_AVAILABLE = False
+
 
 
 # ===========================================================================
@@ -361,6 +398,89 @@ def parse_args() -> argparse.Namespace:
         help="Contrast limit for CLAHE preprocessing. Default: 2.0"
     )
 
+    # --- Tier-3: TCN Temporal Behavior Model ---
+    parser.add_argument(
+        "--enable-tcn",
+        dest="enable_tcn",
+        action="store_true",
+        default=True,
+        help="Enable 1D TCN + Attention Temporal Behavior Model (default: True)."
+    )
+    parser.add_argument(
+        "--no-tcn",
+        dest="enable_tcn",
+        action="store_false",
+        help="Disable TCN Temporal Behavior Model."
+    )
+
+    # --- Tier-3: VLM Qwen2-VL ---
+    parser.add_argument(
+        "--enable-vlm",
+        dest="enable_vlm",
+        action="store_true",
+        default=True,
+        help="Enable Qwen2-VL VLM for high-risk incident captioning (default: True)."
+    )
+    parser.add_argument(
+        "--no-vlm",
+        dest="enable_vlm",
+        action="store_false",
+        help="Disable VLM incident captioning."
+    )
+
+    # --- Tier-3: LLM Llama 3.1 ---
+    parser.add_argument(
+        "--enable-llm",
+        dest="enable_llm",
+        action="store_true",
+        default=True,
+        help="Enable Llama 3.1 8B LLM for summaries and operator chat (default: True)."
+    )
+    parser.add_argument(
+        "--no-llm",
+        dest="enable_llm",
+        action="store_false",
+        help="Disable LLM summarizer and query engine."
+    )
+
+    # --- Tier-3: Re-ID Multi-Camera ---
+    parser.add_argument(
+        "--enable-reid",
+        dest="enable_reid",
+        action="store_true",
+        default=False,
+        help="Enable two-camera Re-ID fusion (default: False, single-camera mode)."
+    )
+
+    # --- Tier-3: Fence Tamper Detection ---
+    parser.add_argument(
+        "--enable-fence-tamper",
+        dest="enable_fence_tamper",
+        action="store_true",
+        default=True,
+        help="Enable fence frame-diff energy tamper detector (default: True)."
+    )
+    parser.add_argument(
+        "--no-fence-tamper",
+        dest="enable_fence_tamper",
+        action="store_false",
+        help="Disable fence tamper detector."
+    )
+
+    # --- Tier-3: VMS REST API Server ---
+    parser.add_argument(
+        "--vms-port",
+        type=int,
+        default=8080,
+        help="Port for VMS REST API & Dashboard. Default: 8080"
+    )
+    parser.add_argument(
+        "--no-vms",
+        action="store_true",
+        default=False,
+        help="Disable VMS REST API server."
+    )
+
     return parser.parse_args()
 
 
@@ -554,6 +674,51 @@ def main():
         zone_context_mgr = ZoneContextMemory(zones=cfg_zones)
         zone_context_mgr.scale_zones_to_frame(frame_width, frame_height)
         logger.info(f"ZoneContextMemory: Tier-2 loaded with {len(zone_context_mgr.zones)} configured zone(s).")
+
+    # --- Step 5f: Initialize Tier-3 Temporal Behavior Model ---
+    temporal_behavior_mgr: Optional[Any] = None
+    if _TEMPORAL_MODEL_AVAILABLE and args.enable_tcn:
+        temporal_behavior_mgr = TemporalBehaviorModel(
+            config=_risk_cfg,
+            boundary_y_ref=576.0 * (frame_height / 720.0),
+        )
+        logger.info("TemporalBehaviorModel: Tier-3 TCN+Attention enabled.")
+
+    # --- Step 5g: Initialize Tier-3 VLM Client ---
+    vlm_client: Optional[Any] = None
+    if _VLM_AVAILABLE and args.enable_vlm:
+        vlm_client = VLMClient(config=_risk_cfg)
+        logger.info("VLMClient: Tier-3 Qwen2-VL enabled.")
+
+    # --- Step 5h: Initialize Tier-3 LLM Client ---
+    llm_client: Optional[Any] = None
+    if _LLM_AVAILABLE and args.enable_llm:
+        llm_client = LLMClient(config=_risk_cfg)
+        logger.info("LLMClient: Tier-3 Llama 3.1 8B enabled.")
+
+    # --- Step 5i: Initialize Tier-3 Re-ID Fusion Engine ---
+    reid_engine: Optional[Any] = None
+    if _REID_AVAILABLE:
+        reid_engine = ReIDFusionEngine(config=_risk_cfg, enabled=args.enable_reid)
+        logger.info(f"ReIDFusionEngine: Tier-3 ready | multi_camera_active={reid_engine.is_multi_camera_active()}")
+
+    # --- Step 5j: Initialize Tier-3 Fence-Tamper Detector ---
+    fence_tamper: Optional[Any] = None
+    if _FENCE_TAMPER_AVAILABLE and args.enable_fence_tamper:
+        fence_tamper = FenceTamperDetector(config=_risk_cfg)
+        fence_tamper.scale_to_frame(frame_width, frame_height)
+        logger.info("FenceTamperDetector: Tier-3 Frame-Diff Energy monitor enabled.")
+
+    # --- Step 5k: Initialize Tier-3 VMS REST API Server & Webhook Dispatcher ---
+    vms_server: Optional[Any] = None
+    if _VMS_API_AVAILABLE and not args.no_vms:
+        state_manager.llm_client = llm_client
+        state_manager.vlm_client = vlm_client
+        state_manager.reid_engine = reid_engine
+        state_manager.temporal_behavior_mgr = temporal_behavior_mgr
+        vms_server = VMSServerThread(port=args.vms_port)
+        vms_server.start()
+        logger.info(f"VMS API Gateway: Tier-3 server live on port {args.vms_port} (Dashboard: /dashboard)")
 
     # --- Step 6: Initialize Data Exporter ---
     exporter = DataExporter(
@@ -751,6 +916,22 @@ def main():
                     )
                 last_abandoned_events = abandoned_events
 
+                # ---------------------------------------------------------------
+                # TIER-3: FENCE-TAMPER DETECTION (Frame-Diff Energy)
+                # ---------------------------------------------------------------
+                fence_tamper_status = None
+                if fence_tamper is not None:
+                    safe_fps = current_fps if current_fps and current_fps > 0 else 15.0
+                    fence_tamper_status = fence_tamper.update(frame, tracks, fps=safe_fps)
+
+                # ---------------------------------------------------------------
+                # TIER-3: RE-ID FEATURE EXTRACTION & TRACK REGISTRATION
+                # ---------------------------------------------------------------
+                if reid_engine is not None:
+                    for t in tracks:
+                        gid = reid_engine.register_track("CAM-01", t["track_id"], frame, t["bbox"])
+                        t["global_track_id"] = gid
+
                 last_tracks          = tracks
                 last_dets            = dets
                 last_very_close_dets = very_close_dets
@@ -829,19 +1010,21 @@ def main():
                 # ---------------------------------------------------------------
                 if risk_engine is not None:
                     alert_cards = risk_engine.update(
-                        tracks             = tracks,
-                        frame_h            = frame_height,
-                        frame_w            = frame_width,
-                        boundary_zones     = boundary_zones,
-                        fps                = current_fps if current_fps and current_fps > 0 else 15.0,
-                        frame_id           = proc_id,
-                        night_mode         = is_night_active,
-                        centroid_histories = track_histories,
-                        very_close_dets    = very_close_dets,
-                        current_time       = datetime.now().time(),
-                        abandoned_events   = abandoned_events,
-                        animal_suppression = args.enable_animal_suppression,
-                        zone_context_mgr   = zone_context_mgr,
+                        tracks                 = tracks,
+                        frame_h                = frame_height,
+                        frame_w                = frame_width,
+                        boundary_zones         = boundary_zones,
+                        fps                    = current_fps if current_fps and current_fps > 0 else 15.0,
+                        frame_id               = proc_id,
+                        night_mode             = is_night_active,
+                        centroid_histories     = track_histories,
+                        very_close_dets        = very_close_dets,
+                        current_time           = datetime.now().time(),
+                        abandoned_events       = abandoned_events,
+                        animal_suppression     = args.enable_animal_suppression,
+                        zone_context_mgr       = zone_context_mgr,
+                        temporal_behavior_mgr  = temporal_behavior_mgr,
+                        fence_tamper_status    = fence_tamper_status,
                     )
                     # Mirror risk engine results into track_alerts for boundary
                     # engine drawing functions (backward compatible)
@@ -853,6 +1036,53 @@ def main():
                                 "severity"  : card.get("severity", "high"),
                                 "zone_id"   : card.get("zone_id", "proximity"),
                             }
+
+                # ---------------------------------------------------------------
+                # TIER-3: VLM CAPTIONING & VMS WEBHOOK DISPATCH
+                # ---------------------------------------------------------------
+                if alert_cards:
+                    for tid, card in alert_cards.items():
+                        c_risk = float(card.get("risk_score", 0.0))
+                        # Trigger VLM on high risk events
+                        if vlm_client is not None and vlm_client.should_trigger(c_risk, tid):
+                            c_bbox = card.get("bbox")
+                            c_ctx = {
+                                "track_id"  : tid,
+                                "camera_id" : "CAM-01",
+                                "zone_id"   : card.get("zone_id", "perimeter"),
+                                "behavior"  : card.get("behavior", "intrusion"),
+                                "risk_score": c_risk,
+                                "is_night"  : is_night_active,
+                                "class"     : card.get("class", "person"),
+                            }
+                            vlm_cap = vlm_client.generate_caption(frame, c_bbox, c_ctx)
+                            card["vlm_caption"] = vlm_cap
+
+                        # Relay high-risk alerts to VMS state manager / webhooks
+                        if _VMS_API_AVAILABLE and c_risk >= 50.0:
+                            snap_uri = vlm_client.get_track_snapshot(tid) if vlm_client is not None else None
+                            ev_data = {
+                                "camera_id"      : "CAM-01",
+                                "track_id"       : tid,
+                                "global_track_id": card.get("global_track_id", f"GID-{tid:03d}" if isinstance(tid, int) else str(tid)),
+                                "risk_score"     : c_risk,
+                                "alert_level"    : card.get("alert_level", "HIGH"),
+                                "behavior"       : card.get("behavior", "unknown"),
+                                "zone_id"        : card.get("zone_id", "perimeter"),
+                                "vlm_caption"    : card.get("vlm_caption"),
+                                "reasoning"      : card.get("reasoning"),
+                                "snapshot"       : snap_uri,
+                                "timestamp"      : datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            }
+                            state_manager.add_event(ev_data)
+                            if vms_server is not None and getattr(vms_server, "is_external", False):
+                                vms_server.relay_alert(ev_data)
+
+                # Check periodic LLM incident summary
+                if llm_client is not None and llm_client.should_generate_summary():
+                    recent_evs = state_manager.get_events(limit=15) if _VMS_API_AVAILABLE else []
+                    summary_txt = llm_client.generate_incident_summary(recent_evs)
+                    logger.info(f"\n[PERIODIC SECURITY BRIEF]\n{summary_txt}\n")
 
                 # ---------------------------------------------------------------
                 # BOUNDARY ENGINE (Hook 4): annotate track dicts before export
@@ -1000,6 +1230,10 @@ def main():
 
                 # 3. Legend in bottom-left
                 draw_legend(frame, has_zones=True)
+
+            # --- Draw Fence-Tamper Overlay (Tier-3) ---
+            if fence_tamper is not None and fence_tamper_status is not None:
+                draw_fence_tamper_overlay(frame, fence_tamper_status, fence_tamper.polygon, proc_id)
 
             # Draw FPS overlay on top-left
             draw_fps_overlay(
@@ -1166,9 +1400,13 @@ def main():
                 )
 
             # ---------------------------------------------------------------
-            # DISPLAY
+            # DISPLAY & VMS WEB STREAM BRIDGE
             # ---------------------------------------------------------------
             cv2.imshow(window_name, frame)
+            if _VMS_API_AVAILABLE:
+                state_manager.set_latest_frame(frame, tracks=last_tracks)
+                if vms_server is not None and getattr(vms_server, "is_external", False):
+                    vms_server.relay_frame(frame, tracks=last_tracks)
 
             # ---------------------------------------------------------------
             # FPS Warning
@@ -1238,6 +1476,11 @@ def main():
         if cap.isOpened():
             cap.release()
             logger.info("Camera/video released.")
+
+        # Stop VMS server thread if active
+        if vms_server is not None:
+            vms_server.stop()
+            logger.info("VMS REST API server stopped.")
 
         # Destroy all OpenCV windows
         cv2.destroyAllWindows()

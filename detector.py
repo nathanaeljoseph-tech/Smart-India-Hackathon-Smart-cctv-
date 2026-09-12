@@ -29,6 +29,40 @@ try:
 except ImportError:
     torch = None
 
+# ---------------------------------------------------------------------------
+# Torchvision NMS Fallback Adapter for Windows Application Control / CPU
+# Ultralytics optionally delegates NMS to torchvision.ops.nms; if torchvision
+# C++ ops fail to load (_C_stable.pyd blocked or torchvision::nms missing),
+# provide a high-performance TorchNMS / OpenCV fallback.
+# ---------------------------------------------------------------------------
+try:
+    import torchvision
+    import torchvision.ops
+    if not hasattr(torchvision.ops, "nms"):
+        raise ImportError("torchvision.ops.nms missing")
+except Exception:
+    import sys
+    import types
+    _tv = types.ModuleType("torchvision")
+    _tv_ops = types.ModuleType("torchvision.ops")
+
+    def _safe_nms(boxes, scores, iou_threshold):
+        try:
+            from ultralytics.utils.nms import TorchNMS
+            return TorchNMS.nms(boxes, scores, iou_threshold)
+        except Exception:
+            b_np = boxes.detach().cpu().numpy()
+            s_np = scores.detach().cpu().numpy()
+            indices = cv2.dnn.NMSBoxes(b_np.tolist(), s_np.tolist(), score_threshold=0.0, nms_threshold=float(iou_threshold))
+            if len(indices) == 0:
+                return torch.empty((0,), dtype=torch.long, device=boxes.device)
+            return torch.tensor(indices.flatten(), dtype=torch.long, device=boxes.device)
+
+    _tv_ops.nms = _safe_nms
+    _tv.ops = _tv_ops
+    sys.modules["torchvision"] = _tv
+    sys.modules["torchvision.ops"] = _tv_ops
+
 try:
     from ultralytics import YOLO
 except ImportError:

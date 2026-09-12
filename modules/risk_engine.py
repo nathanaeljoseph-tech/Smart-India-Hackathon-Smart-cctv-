@@ -516,6 +516,7 @@ class RiskEngine:
                 del self._state[old_id]
 
         suppress_animals = self.animal_suppression_enabled if animal_suppression is None else animal_suppression
+        temporal_mgr = kwargs.get("temporal_behavior_mgr") or kwargs.get("temporal_model")
 
         for t in tracks:
             tid  = t["track_id"]
@@ -613,6 +614,7 @@ class RiskEngine:
             # ---- 4. Context & Target Classification Check ----
             context_violation = False
             context_reason = ""
+            tcn_scores = None
 
             if is_animal and suppress_animals:
                 # ANIMAL SUPPRESSION: Animal detected and suppression is active
@@ -718,10 +720,28 @@ class RiskEngine:
                 if context_violation and context_reason:
                     reasoning = f"{reasoning} [{context_reason}]"
 
+                # Tier-3: TCN Temporal Behavior Model Score Fusion
+                tcn_scores = None
+                if temporal_mgr is not None:
+                    tcn_scores = temporal_mgr.update_track(
+                        track_id=tid,
+                        centroid=(ema_cx, ema_cy),
+                        frame_w=frame_w,
+                        frame_h=frame_h,
+                        in_restricted_zone=in_restricted,
+                        dwell_sec=dwell_sec
+                    )
+                    fused_score, fuse_reason = temporal_mgr.fuse_scores(risk_score, tcn_scores)
+                    state["risk"] = fused_score
+                    risk_score = fused_score
+                    alert_level = _risk_to_alert_level(risk_score)
+                    reasoning = f"{reasoning} [{fuse_reason}]"
+
             # Build alert card
             card: Dict[str, Any] = {
                 # Identity
                 "track_id"         : tid,
+                "global_track_id"  : t.get("global_track_id", f"GID-{tid:03d}" if isinstance(tid, int) else str(tid)),
                 "bbox"             : bbox,
                 "centroid"         : [raw_cx, raw_cy],
                 "ema_centroid"     : [ema_cx, ema_cy],
@@ -739,6 +759,7 @@ class RiskEngine:
                 "alert_level"      : alert_level,
                 "reasoning"        : reasoning,
                 "dwell_sec"        : round(dwell_sec, 1),
+                "tcn_scores"       : tcn_scores,
                 # Boundary engine compat fields
                 "alert_type"       : alert_type_be,
                 "severity"         : severity_be,
@@ -859,6 +880,31 @@ class RiskEngine:
                     "zone_name"    : ab_zone_name,
                     "zone_type"    : effective_zone_type,
                 }
+
+        # Tier-3 Feature: Fence-Tamper Alert Event Injection
+        ft_status = kwargs.get("fence_tamper_status")
+        if ft_status and getattr(ft_status, "is_tamper", False):
+            ft_id = "FENCE-TAMPER"
+            alert_cards[ft_id] = {
+                "track_id"       : ft_id,
+                "global_track_id": "GID-TAMPER",
+                "bbox"           : [0, int(frame_h * 0.72), frame_w, int(frame_h * 0.83)],
+                "centroid"       : [frame_w // 2, int(frame_h * 0.77)],
+                "ema_centroid"   : [frame_w // 2, int(frame_h * 0.77)],
+                "confidence"     : 0.95,
+                "track_age"      : 1,
+                "is_too_close"   : False,
+                "class"          : "barrier",
+                "behavior"       : f"tamper_{ft_status.tamper_type}",
+                "risk_score"     : ft_status.risk_score,
+                "alert_level"    : ft_status.alert_level,
+                "reasoning"      : ft_status.message,
+                "dwell_sec"      : getattr(ft_status, "duration_sec", 0.0),
+                "alert_type"     : "tamper",
+                "severity"       : "critical" if ft_status.alert_level == "CRITICAL" else "high",
+                "zone_id"        : "fence_roi",
+                "energy"         : ft_status.energy,
+            }
 
         return alert_cards
 

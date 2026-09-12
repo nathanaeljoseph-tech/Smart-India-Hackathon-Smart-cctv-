@@ -143,3 +143,80 @@ zones:
     time_rules: []
     night_multiplier: 1.20
 
+# ---------------------------------------------------------------------------
+# Tier-3 Enhancements Configuration
+# ---------------------------------------------------------------------------
+
+# Feature 1: TCN + Attention Temporal Behavior Model
+temporal_behavior:
+  enabled: true
+  history_len: 24             # Number of frames in temporal sequence window (16-32)
+  alpha_rule: 0.50            # Fusion weight for rule-based risk score
+  beta_tcn: 0.50              # Fusion weight for TCN-based temporal score
+  input_dim: 8                # [x, y, vx, vy, speed, border_dist, is_restricted, dwell_norm]
+  hidden_channels: 32         # 1D TCN hidden feature channels
+  num_levels: 3               # Dilation levels (1, 2, 4)
+  boundary_y_ref: 576.0       # Border reference line (between perimeter and approach_band)
+
+# Feature 2: VLM Integration (Qwen2-VL)
+vlm:
+  enabled: true
+  provider: "ollama"          # "ollama" or "vllm"
+  model: "qwen2-vl:7b"        # Qwen2-VL 2B or 7B model tag
+  endpoint: "http://localhost:11434"
+  min_risk_trigger: 60.0      # Trigger VLM captioning only for high-risk events (>=60-70)
+  cooldown_seconds: 15.0      # Cooldown per track to prevent repeated API flooding
+  timeout_seconds: 4.0        # Fast network timeout with instant fallback
+
+# Feature 3: LLM Integration (Llama 3.1 8B Instruct)
+llm:
+  enabled: true
+  provider: "ollama"          # "ollama" or "vllm"
+  model: "llama3.1:8b"        # Llama 3.1 8B Instruct model tag
+  endpoint: "http://localhost:11434"
+  summary_interval_sec: 300.0 # 5-minute periodic security incident summary
+  timeout_seconds: 5.0        # Fast timeout with robust structured fallback
+
+# Feature 4: Two-Camera Re-ID Fusion (Multi-Camera Structure Ready)
+reid:
+  enabled: false              # OFF by default for single-camera demo, structure ready
+  feature_dim: 128            # Color histogram + spatial texture embedding dimension
+  similarity_threshold: 0.72  # Cosine similarity threshold for cross-camera matching
+  transit_time_window: 12.0   # Max seconds for target to travel between camera FOVs
+  direction_bias: "eastbound" # Spatial assumption: CAM-02 is to the right/east of CAM-01
+
+# Camera source registry
+cameras:
+  - id: "CAM-01"
+    source: 0
+    name: "Perimeter Main Gate"
+    enabled: true
+  - id: "CAM-02"
+    source: 2
+    name: "Perimeter East Fence"
+    enabled: false            # Optional secondary camera, ready to enable
+
+# Feature 5: Fence-Tamper Detection (Frame-Difference Energy Monitor)
+fence_tamper:
+  enabled: true
+  # Fence boundary ROI polygon (along perimeter-approach border y=520 to y=600)
+  roi_polygon:
+    - [0,    520]
+    - [1280, 520]
+    - [1280, 600]
+    - [0,    600]
+  energy_spike_threshold: 30.0     # Mean frame-difference energy spike without tracked person
+  persistent_threshold: 18.0       # Continuous disturbance energy threshold
+  persistent_duration_sec: 2.0     # Seconds of continuous energy to trigger tamper
+  tamper_base_risk: 85.0           # Base risk score (70-90) assigned to fence tamper events
+  min_motion_area: 1200            # Minimum disturbed pixel count to trigger
+
+# Feature 6: VMS / Webhook API Integration
+vms:
+  api_enabled: true
+  host: "127.0.0.1"
+  port: 8080
+  api_key: "bordervigil-secret-key" # API authentication header
+  min_alert_risk_webhook: 70.0      # Only dispatch webhooks for high-risk (>=70) alerts
+
+

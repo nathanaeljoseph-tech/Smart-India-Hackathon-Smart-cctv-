@@ -343,3 +343,232 @@ def draw_tamper_overlay(
     cv2.putText(frame, ts,
                 (12, h - 14),
                 font_icon, 0.5, (160, 160, 160), 1, cv2.LINE_AA)
+
+
+# ===========================================================================
+# Tier-3 Feature: Fence-Tamper Detection (Frame-Diff Energy)
+# ===========================================================================
+
+@dataclass
+class FenceTamperStatus:
+    """Result returned by FenceTamperDetector.update() each frame."""
+    is_tamper          : bool  = False
+    tamper_type        : str   = "none"   # "none" | "spike" | "persistent"
+    energy             : float = 0.0      # Current mean diff energy
+    baseline_energy    : float = 0.0
+    spike_detected     : bool  = False
+    persistent_detected: bool  = False
+    risk_score         : float = 0.0      # 0.0 - 100.0 scale
+    alert_level        : str   = "NORMAL" # "NORMAL" | "HIGH" | "CRITICAL"
+    message            : str   = ""
+    duration_sec       : float = 0.0
+    evidence_snapshot  : Optional[np.ndarray] = None
+
+
+class FenceTamperDetector:
+    """
+    Monitors a designated fence or barrier ROI for physical disturbance, wire cutting,
+    or structural shaking using frame-difference energy aggregation.
+
+    Detects:
+      1. Energy Spike without tracked object: sudden physical impact / fence shake.
+      2. Persistent High Energy: ongoing cutting, climbing, or mechanical tampering.
+    """
+    def __init__(
+        self,
+        config: Optional[Dict[str, Any]] = None,
+        roi_polygon: Optional[List[List[int]]] = None,
+        energy_spike_threshold: float = 30.0,
+        persistent_threshold: float = 18.0,
+        persistent_duration_sec: float = 2.0,
+        tamper_base_risk: float = 85.0,
+    ):
+        ft_cfg = (config or {}).get("fence_tamper", {}) if config else {}
+        self.enabled = bool(ft_cfg.get("enabled", True))
+        self.spike_thresh = float(ft_cfg.get("energy_spike_threshold", energy_spike_threshold))
+        self.pers_thresh = float(ft_cfg.get("persistent_threshold", persistent_threshold))
+        self.pers_duration = float(ft_cfg.get("persistent_duration_sec", persistent_duration_sec))
+        self.base_risk = float(ft_cfg.get("tamper_base_risk", tamper_base_risk))
+        self.min_motion_area = int(ft_cfg.get("min_motion_area", 1200))
+
+        raw_poly = ft_cfg.get("roi_polygon") or roi_polygon or [
+            [0, 520], [1280, 520], [1280, 600], [0, 600]
+        ]
+        self.raw_polygon = np.array(raw_poly, dtype=np.int32)
+        self.polygon = self.raw_polygon.copy()
+
+        self._mask: Optional[np.ndarray] = None
+        self._mask_area: int = 1
+        self._prev_roi_gray: Optional[np.ndarray] = None
+        self._energy_history: List[float] = []
+        self._pers_start_time: Optional[float] = None
+        self._pers_active_sec: float = 0.0
+
+        logger.info(
+            f"FenceTamperDetector ready | enabled={self.enabled} | "
+            f"spike_thresh={self.spike_thresh} | pers_thresh={self.pers_thresh} | "
+            f"pers_dur={self.pers_duration}s | risk={self.base_risk}"
+        )
+
+    # -----------------------------------------------------------------------
+    def scale_to_frame(self, frame_w: int, frame_h: int, ref_w: int = 1280, ref_h: int = 720):
+        """Scale ROI polygon to match camera resolution."""
+        sx = frame_w / float(ref_w)
+        sy = frame_h / float(ref_h)
+        scaled = []
+        for pt in self.raw_polygon:
+            scaled.append([int(pt[0] * sx), int(pt[1] * sy)])
+        self.polygon = np.array(scaled, dtype=np.int32)
+        self._mask = None  # Force mask rebuild
+
+    # -----------------------------------------------------------------------
+    def _build_mask(self, h: int, w: int):
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(mask, [self.polygon], 255)
+        self._mask = mask
+        self._mask_area = max(1, int(np.count_nonzero(mask)))
+
+    # -----------------------------------------------------------------------
+    def update(
+        self,
+        frame: np.ndarray,
+        tracked_objects: Optional[List[Dict[str, Any]]] = None,
+        fps: float = 15.0
+    ) -> FenceTamperStatus:
+        """
+        Process frame and evaluate fence energy metrics.
+
+        Args:
+            frame: Current BGR video frame.
+            tracked_objects: List of current track dicts with 'bbox'.
+            fps: Frame rate for timing.
+        """
+        if not self.enabled or frame is None or frame.size == 0:
+            return FenceTamperStatus()
+
+        h, w = frame.shape[:2]
+        if self._mask is None or self._mask.shape != (h, w):
+            self._build_mask(h, w)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # Apply slight Gaussian blur to suppress camera sensor noise
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        if self._prev_roi_gray is None or self._prev_roi_gray.shape != blurred.shape:
+            self._prev_roi_gray = blurred
+            return FenceTamperStatus()
+
+        # Compute absolute difference inside ROI
+        diff = cv2.absdiff(blurred, self._prev_roi_gray)
+        self._prev_roi_gray = blurred
+
+        masked_diff = cv2.bitwise_and(diff, diff, mask=self._mask)
+        mean_energy = float(np.sum(masked_diff)) / float(self._mask_area)
+
+        self._energy_history.append(mean_energy)
+        if len(self._energy_history) > 30:
+            self._energy_history.pop(0)
+
+        # Check if a tracked person/vehicle overlaps the fence ROI
+        has_overlapping_track = False
+        rx1, ry1 = int(np.min(self.polygon[:, 0])), int(np.min(self.polygon[:, 1]))
+        rx2, ry2 = int(np.max(self.polygon[:, 0])), int(np.max(self.polygon[:, 1]))
+
+        if tracked_objects:
+            for obj in tracked_objects:
+                bx1, by1, bx2, by2 = obj.get("bbox", [0, 0, 0, 0])
+                # Overlap test between bbox and fence bounding box
+                if not (bx2 < rx1 or bx1 > rx2 or by2 < ry1 or by1 > ry2):
+                    has_overlapping_track = True
+                    break
+
+        now = time.time()
+        spike = (mean_energy >= self.spike_thresh) and not has_overlapping_track
+        persistent = False
+
+        if mean_energy >= self.pers_thresh and not has_overlapping_track:
+            if self._pers_start_time is None:
+                self._pers_start_time = now
+            self._pers_active_sec = now - self._pers_start_time
+            if self._pers_active_sec >= self.pers_duration:
+                persistent = True
+        else:
+            self._pers_start_time = None
+            self._pers_active_sec = 0.0
+
+        is_tamper = spike or persistent
+        if not is_tamper:
+            return FenceTamperStatus(
+                is_tamper=False,
+                energy=round(mean_energy, 2),
+                alert_level="NORMAL"
+            )
+
+        tamper_type = "spike" if spike else "persistent"
+        severity = "CRITICAL" if spike else "HIGH"
+        risk_val = self.base_risk if spike else (self.base_risk - 10.0)
+
+        msg = (
+            f"FENCE TAMPER [{tamper_type.upper()}]: Frame-diff energy {mean_energy:.1f} "
+            f"(threshold: {self.spike_thresh if spike else self.pers_thresh:.1f}) "
+            f"without tracked object — potential perimeter barrier breach or wire vibration."
+        )
+
+        logger.warning(msg)
+
+        return FenceTamperStatus(
+            is_tamper=True,
+            tamper_type=tamper_type,
+            energy=round(mean_energy, 2),
+            spike_detected=spike,
+            persistent_detected=persistent,
+            risk_score=round(risk_val, 1),
+            alert_level=severity,
+            message=msg,
+            duration_sec=round(self._pers_active_sec, 1),
+            evidence_snapshot=frame.copy()
+        )
+
+    def reset(self):
+        self._prev_roi_gray = None
+        self._energy_history.clear()
+        self._pers_start_time = None
+        self._pers_active_sec = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Fence Tamper Overlay
+# ---------------------------------------------------------------------------
+
+def draw_fence_tamper_overlay(
+    frame: np.ndarray,
+    status: FenceTamperStatus,
+    polygon: np.ndarray,
+    frame_id: int = 0
+) -> None:
+    """Draw fence ROI and tamper warning banner on frame."""
+    if polygon is None or len(polygon) < 3:
+        return
+
+    # Draw fence ROI polygon (flashing red if tamper, subtle purple if normal)
+    if status.is_tamper:
+        is_blink = (frame_id // 6) % 2 == 0
+        poly_col = (0, 0, 255) if is_blink else (0, 140, 255)
+        thickness = 3
+    else:
+        poly_col = (180, 100, 220)
+        thickness = 1
+
+    cv2.polylines(frame, [polygon], isClosed=True, color=poly_col, thickness=thickness)
+
+    # Fence ROI label
+    fx, fy = int(polygon[0][0]), int(polygon[0][1])
+    fence_lbl = f" FENCE-ROI (Energy: {status.energy:.1f}) "
+    cv2.putText(frame, fence_lbl, (fx + 10, fy - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.42, poly_col, 1, cv2.LINE_AA)
+
+    if status.is_tamper:
+        h, w = frame.shape[:2]
+        banner_bg = (0, 0, 200)
+        cv2.rectangle(frame, (0, 36), (w, 68), banner_bg, -1)
+        alert_txt = f" [!] CRITICAL: FENCE TAMPER / PHYSICAL DISTURBANCE DETECTED ({status.tamper_type.upper()}) | Risk: {status.risk_score:.0f} "
+        cv2.putText(frame, alert_txt, (15, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
